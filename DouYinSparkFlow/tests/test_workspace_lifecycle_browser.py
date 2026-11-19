@@ -97,6 +97,28 @@ class WorkspaceLifecycleBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def calls(self, contains):
         return await self.page.evaluate("part=>events.filter(item=>item.url.includes(part))", contains)
 
+    async def test_served_controller_keeps_workspace_open_during_manual_sms_verification(self):
+        await self.page.evaluate("""() => {
+          const root = document.getElementById('login-desktop-controls');
+          root.insertAdjacentHTML('beforeend', '<button data-open-manual-verification hidden>打开验证窗口</button>');
+          const ordinaryReply = reply;
+          reply = url => url.startsWith('/login-desktop/qr?')
+            ? jsonResponse({state:'qr_verification_required', verification_step:'sms_method', retryable:false}, {status:202})
+            : ordinaryReply(url);
+        }""")
+        await self.page.add_script_tag(path=str(STATIC / "login-workspace.js"))
+        await self.interaction()
+        await self.open()
+        await self.page.clock.run_for(1100)
+        await self.page.wait_for_function("document.querySelector('[data-login-qr-status]').textContent.includes('接收验证码登录')")
+        await self.page.locator('[data-open-manual-verification]').click()
+        await self.page.clock.run_for(1000)
+        await self.page.wait_for_function("!document.querySelector('[data-interaction-image]').hidden")
+        self.assertTrue(await self.page.locator('[data-login-interaction]').evaluate('(panel) => panel.open'))
+        self.assertEqual([], await self.calls('/interaction/action'))
+        self.assertEqual([], await self.calls('/qr/refresh'))
+        self.assertEqual(1, len(await self.calls('/login-desktop/qr?')))
+
     async def start_cookie_save(self):
         await self.page.evaluate("""() => {
           document.getElementById('login-desktop-controls').insertAdjacentHTML('beforeend',

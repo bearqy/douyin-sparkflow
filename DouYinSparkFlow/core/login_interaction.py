@@ -3,6 +3,7 @@
 import asyncio
 import hmac
 import math
+import re
 from urllib.parse import urlsplit
 
 
@@ -14,6 +15,36 @@ LOGIN_DOMAINS = (
 )
 SAFE_KEYS = {"Enter", "Backspace", "Delete", "Escape", "ArrowLeft", "ArrowRight",
              "ArrowUp", "ArrowDown", "Home", "End", "Control+A"}
+SMS_METHOD_LABEL = re.compile(r"^接收(?:短信)?验证码\s*登[录陆]$")
+SMS_CODE_LABEL = re.compile(r"验证码(?:已发送|已发至)|请输入短信验证码")
+
+
+async def sms_verification_step(page):
+    """Inspect visible prompts only. Never read input values or send an SMS."""
+    async def visible(locator):
+        for item in await locator.all():
+            if await item.is_visible():
+                return True
+        return False
+
+    async def inspect_frames():
+        for frame in page.frames:
+            if not allowed_login_url(frame.url):
+                continue
+            if await visible(frame.get_by_text(SMS_METHOD_LABEL)):
+                return "sms_method"
+            if await visible(frame.locator('input[autocomplete="one-time-code"]')) or (
+                await visible(frame.get_by_text(SMS_CODE_LABEL))
+                and await visible(frame.locator('input:not([type="hidden"])'))
+            ):
+                return "sms_code"
+        return ""
+
+    try:
+        return await asyncio.wait_for(inspect_frames(), timeout=0.8)
+    except Exception:
+        # Navigation or a detached challenge frame is an unknown observation.
+        return ""
 
 
 class InteractionError(RuntimeError):
@@ -132,7 +163,11 @@ class LoginInteraction:
                 text = action.get("text")
                 if set(action) - {"type", "text"} or not isinstance(text, str) or not 1 <= len(text) <= 1024 or "\x00" in text:
                     raise InteractionError("输入内容无效或过长")
-                await page.keyboard.insert_text(text)
+                if text.isascii() and text.isdecimal() and 4 <= len(text) <= 8:
+                    # Some verification forms advance one field per digit on key events.
+                    await page.keyboard.type(text)
+                else:
+                    await page.keyboard.insert_text(text)
             else:
                 if set(action) - {"type", "key"} or action.get("key") not in SAFE_KEYS:
                     raise InteractionError("不支持这个按键")

@@ -64,10 +64,13 @@
         <img class="login-qr-image" data-login-qr alt="抖音登录二维码" hidden>
         <div class="qr-placeholder"><i data-lucide="qr-code"></i><span>点“{% if relogin_account %}打开登录工作区{% else %}添加新账号{% endif %}”后，二维码会显示在这里</span></div>
       </div>
-      <p class="muted compact" data-login-qr-status>二维码会在登录工作区分配给你之后自动出现。</p>
+      <p class="muted compact" data-login-qr-status role="status">二维码会在登录工作区分配给你之后自动出现。</p>
       <div class="form-actions" style="justify-content: center">
         <button class="button button-quiet button-sm" type="button" data-refresh-login-qr>
           <i data-lucide="refresh-cw"></i><span>刷新二维码</span>
+        </button>
+        <button class="button button-soft button-sm" type="button" data-open-manual-verification aria-controls="login-interaction" hidden>
+          <i data-lucide="shield-check"></i><span>打开验证窗口</span>
         </button>
         <button class="button button-quiet button-sm" type="button" data-recover-login-workspace hidden>
           <i data-lucide="rotate-cw"></i><span>重新检查工作区</span>
@@ -173,10 +176,11 @@
       title="交互式登录浏览器"
     ></iframe>
   </div>
-  {% else %}
-  <details class="card login-interaction" data-login-interaction>
+  {% endif %}
+  <details id="login-interaction" class="card login-interaction" data-login-interaction>
     <summary>登录窗口 · 验证码 / 密码</summary>
     <p class="muted compact" data-interaction-status role="status" aria-live="polite">申请工作区后，可以在这里完成手动验证。画面显示后再操作。</p>
+    <p class="muted compact">抖音要求短信验证时，先在画面中点击“接收验证码登录”，按抖音提示获取短信。收到后，先点画面里的验证码框，再在下方输入。</p>
     <div class="form-actions">
       <button class="button button-quiet button-sm" type="button" data-interaction-expand aria-expanded="false">放大窗口</button>
       <button class="button button-quiet button-sm" type="button" data-interaction-refresh>更新画面</button>
@@ -195,7 +199,6 @@
     </div>
     <p class="muted compact">输入完成后会清空下方输入栏。登录成功后，回到页面顶部保存账号。</p>
   </details>
-  {% endif %}
 </section>
 <script defer src="{{ asset_url('login-interaction.js') }}"></script>
 {% endblock %}

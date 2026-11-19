@@ -9,6 +9,7 @@ from unittest.mock import patch
 from playwright.async_api import async_playwright
 
 from core.login_interaction import LoginInteraction, InteractionError, allowed_login_url
+from login_desktop_server import LoginDesktopManager, _probe_login_qr
 from tests import test_shared_security as fixtures
 from webui import app as app_module, login_lock
 
@@ -56,6 +57,40 @@ class InteractionBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(frame.startswith(b"\xff\xd8"))
         await self.click(50, 105)
         self.assertEqual("1", await self.page.locator("body").get_attribute("data-done"))
+
+    async def test_manual_sms_challenge_in_frame_takes_precedence_over_old_qr(self):
+        await self.context.route("https://creator.douyin.com/sms-fixture", lambda route: route.fulfill(
+            content_type="text/html; charset=utf-8", body="""
+            <button style="position:absolute;left:20px;top:20px" onclick="
+                this.hidden=true; document.querySelector('#code').hidden=false
+            ">接收验证码登陆</button>
+            <div id="code" hidden style="position:absolute;left:20px;top:60px">
+              <label>请输入短信验证码<input autocomplete="one-time-code" maxlength="1" style="width:20px"></label>
+              <input maxlength="1" style="width:20px" onkeyup="this.nextElementSibling.focus()">
+              <input maxlength="1" style="width:20px" onkeyup="this.nextElementSibling.focus()">
+              <input maxlength="1" style="width:20px">
+            </div>
+            <script>const first = document.querySelector('input');
+              first.onkeyup = () => first.parentElement.nextElementSibling.focus();</script>
+            """,
+        ))
+        await self.page.set_content('''<img class="qrcode" width="140" height="140" alt="测试二维码">
+          <iframe title="验证" src="https://creator.douyin.com/sms-fixture"
+          style="position:absolute;left:0;top:0;width:310px;height:180px;border:0"></iframe>''')
+        self.assertEqual(("verification_required", "sms_method"), await _probe_login_qr(self.page))
+        await self.click(60, 30)
+        self.assertEqual(("verification_required", "sms_code"), await _probe_login_qr(self.page))
+
+        manager = LoginDesktopManager()
+        with patch.object(manager, "_get_active_page", return_value=self.page), patch.object(manager, "_qr_payload") as refresh:
+            self.assertEqual("sms_code", (await manager._refresh_login_qr_locked())["verification_step"])
+            refresh.assert_not_called()
+
+        inputs = self.page.frame_locator("iframe").locator("input")
+        rect = await inputs.first.bounding_box()
+        await self.click(rect["x"] + 5, rect["y"] + 5)
+        await self.interaction.act(TOKEN, self.page, {"type": "text", "text": "2468"})
+        self.assertEqual(list("2468"), [await field.input_value() for field in await inputs.all()])
 
     async def test_browser_shortcuts_and_invalid_coordinates_are_rejected(self):
         for action in ({"type": "key", "key": "Control+L"}, {"type": "key", "key": "F12"},

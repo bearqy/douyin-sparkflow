@@ -715,6 +715,7 @@ fieldset > legend { padding: 0 6px; }
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
 .login-interaction { min-width: 0; align-self: start; }
+.login-layout:has(> .desktop-frame-wrap) > .login-interaction { grid-column: 1 / -1; }
 .login-interaction > summary { cursor: pointer; font-weight: 650; padding: 8px 0; }
 .interaction-viewport { overflow: hidden; margin: 12px 0; border-radius: 10px; background: #eef1f5; }
 .interaction-viewport img { display: block; width: 100%; height: auto; touch-action: none; user-select: none; }

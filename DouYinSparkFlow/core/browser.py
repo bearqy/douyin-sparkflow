@@ -80,11 +80,13 @@ def _douyin_network_mode():
 
 
 def douyin_network_modes():
-    # Direct is the default; Mihomo is the fallback unless explicitly selected.
+    # An empty proxy address means there is no Mihomo service to fall back to.
     mode = _douyin_network_mode()
     if mode == "mihomo":
         return ("mihomo",)
-    return ("direct", "mihomo")
+    if douyin_proxy_url(get_app_settings(force_reload=True)):
+        return ("direct", "mihomo")
+    return ("direct",)
 
 
 def _douyin_browser_proxy(network_mode=None):

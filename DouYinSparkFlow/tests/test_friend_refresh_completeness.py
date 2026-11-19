@@ -473,6 +473,22 @@ class IncompleteScanFieldTests(unittest.TestCase):
 
 
 class FriendRefreshLoggingTests(unittest.TestCase):
+    def test_broken_fallback_preserves_the_error_from_the_loaded_page(self):
+        account = {"cookies": [{"name": "sessionid", "value": "x"}]}
+        page_failure = friends_module.FriendRefreshError("抖音私信页已打开，但好友列表未加载完成")
+        with (
+            patch.object(friends_module, "douyin_network_modes", return_value=("direct", "mihomo")),
+            patch.object(
+                friends_module, "_fetch_account_friends_once",
+                side_effect=[page_failure, RuntimeError("net::ERR_PROXY_CONNECTION_FAILED")],
+            ),
+            self.assertRaises(friends_module.FriendRefreshError) as caught,
+        ):
+            asyncio.run(friends_module.fetch_account_friends(account))
+
+        self.assertEqual(friends_module.CATEGORY_STRUCTURE_CHANGED, caught.exception.category)
+        self.assertEqual(str(page_failure), str(caught.exception))
+
     def test_route_log_names_account_route_count_and_completeness(self):
         account = {
             "unique_id": "123",

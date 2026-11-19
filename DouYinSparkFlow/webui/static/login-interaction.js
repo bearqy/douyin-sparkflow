@@ -99,7 +99,11 @@
       clearTimeout(timer);
       const task = queue.catch(() => {}).then(async () => {
         if (!current(heldTicket, heldEpoch)) return false;
-        return Boolean(await request("action", value, heldTicket, heldEpoch));
+        const result = await request("action", value, heldTicket, heldEpoch);
+        if (result && (value.phase === "up" || value.key === "Enter")) {
+          root.dispatchEvent(new Event("login-interaction-confirmed"));
+        }
+        return Boolean(result);
       }).finally(() => {
         if (heldEpoch === epoch) {
           pendingActions -= 1;

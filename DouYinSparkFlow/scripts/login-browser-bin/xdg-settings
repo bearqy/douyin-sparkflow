@@ -1,0 +1,15 @@
+#!/bin/sh
+
+# The Linux login desktop has no companion app. Chromium drops an external
+# protocol launch without changing the web page when it is its own handler.
+if [ "$#" -eq 4 ] && [ "$1" = check ] && [ "$2" = default-url-scheme-handler ]; then
+    case "$3" in
+        http|https) ;;
+        *) printf '%s\n' yes; exit 0 ;;
+    esac
+fi
+
+if [ -x /usr/bin/xdg-settings ]; then
+    exec /usr/bin/xdg-settings "$@"
+fi
+exit 1

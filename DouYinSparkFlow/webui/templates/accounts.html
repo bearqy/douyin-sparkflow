@@ -59,7 +59,7 @@
         <span class="pill {% if ident.identity_state == 'conflict' %}danger{% elif ident.identity_state == 'verified' %}success{% elif ident.identity_state == 'unverified' %}warning{% endif %}" title="{{ ident.identity_hint }}" data-identity-state="{{ ident.identity_state }}">{{ ident.identity_label }}</span>
         {% set patrol = patrol_view(account) %}
         {% if patrol.has %}<span class="pill {{ patrol.pill }}" title="最近一次巡查：{{ patrol.checkedDisplay }}" data-patrol-pill="{{ patrol.conclusion }}">{% if patrol.conclusion == 'ok' %}巡查正常{% else %}巡查：{{ patrol.conclusionLabel }}{% endif %}</span>{% endif %}
-        <span class="pill {% if enabled %}success{% else %}warning{% endif %}" data-account-enabled>{% if enabled %}已启用{% else %}已停用{% endif %}</span>
+        <span class="pill {% if enabled %}success{% else %}warning{% endif %}" title="自动续火花开关" data-account-enabled>{% if enabled %}已启用{% else %}已停用{% endif %}</span>
       </span>
       <i class="fold-chevron" data-lucide="chevron-down"></i>
     </summary>

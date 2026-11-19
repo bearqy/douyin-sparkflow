@@ -96,7 +96,6 @@ IDENTITY_RETRY_BUDGET_MS = 20000
 # render; waiting a full navigation timeout there would stall the save.
 IDENTITY_RELOAD_TIMEOUT_SECONDS = 20
 CHAT_PAGE_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
-FRIENDS_TAB_SELECTOR = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
 # Douyin's chat page is a virtualized list and its generated wrapper classes and
 # child indexes change frequently.  Keep semantic/current selectors first, with
 # the historical XPath selectors last for older page variants.
@@ -135,6 +134,10 @@ LOADING_SELECTOR = LOADING_SELECTORS[0]
 FIRST_FRIEND_SELECTOR = FRIEND_ROW_SELECTORS[0]
 FRIEND_NAME_SELECTOR = FRIEND_NAME_SELECTORS[0]
 LOGIN_MASK_SELECTORS = [".login-mask", ".login-guide-container", ".login-img-code-wrapper"]
+CREATOR_LOGIN_FORM_FIELDS = (
+    'input[type="tel"][placeholder="请输入手机号"]:visible',
+    'input[type="tel"][placeholder="请输入验证码"]:visible',
+)
 NON_LOGIN_DIALOG_DISMISS_TEXTS = (
     "我知道了",
     "知道了",
@@ -267,6 +270,21 @@ async def _ensure_logged_in(page):
             raise
         except Exception:
             continue
+    # The newer creator login screen has generated classes. Require both
+    # visible login fields so a message containing "扫码登录" cannot match.
+    try:
+        form_visible = all(
+            await asyncio.gather(
+                *(page.locator(selector).count() for selector in CREATOR_LOGIN_FORM_FIELDS)
+            )
+        )
+    except Exception:
+        return
+    if form_visible:
+        raise FriendRefreshError(
+            "抖音正在要求重新登录，请在此账号下重新扫码",
+            category=CATEGORY_LOGIN_REQUIRED,
+        )
 
 
 async def _dismiss_non_login_dialogs(page):
@@ -280,24 +298,19 @@ async def _dismiss_non_login_dialogs(page):
 
 
 async def _click_friends_tab(page):
-    await page.wait_for_selector("#sub-app", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
+    sub_app = page.locator("#sub-app")
+    await sub_app.wait_for(timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
     try:
-        await page.get_by_role("tab", name="朋友私信", exact=True).click(timeout=5000)
+        await sub_app.get_by_role("tab", name="朋友私信", exact=True).click(timeout=5000)
         return
     except Exception:
-        pass
+        await _ensure_logged_in(page)
 
     try:
-        await page.locator(FRIENDS_TAB_SELECTOR).click(timeout=10000)
-        return
-    except Exception:
-        pass
-
-    try:
-        await page.get_by_text("朋友私信", exact=True).click(timeout=10000)
-        return
+        await sub_app.get_by_text("朋友私信", exact=True).click(timeout=10000)
     except Exception as exc:
-        raise RuntimeError("未找到朋友私信标签") from exc
+        await _ensure_logged_in(page)
+        raise FriendRefreshError("未找到朋友私信标签") from exc
 
 
 async def _friend_list_dom_summary(page):
@@ -338,6 +351,7 @@ async def _first_visible_locator(page, selectors):
 async def _wait_for_friend_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY_TIMEOUT_SECONDS):
     started_at = asyncio.get_running_loop().time()
     while asyncio.get_running_loop().time() - started_at < timeout_seconds:
+        await _ensure_logged_in(page)
         await _dismiss_non_login_dialogs(page)
         selector, locator = await _first_visible_locator(page, FRIEND_ROW_SELECTORS)
         if locator:
@@ -362,11 +376,12 @@ async def _wait_for_friend_rows_or_empty(page, timeout_seconds=FRIEND_LIST_READY
         await asyncio.sleep(0.5)
 
     summary = await _friend_list_dom_summary(page)
+    summary.pop("text", None)
+    logger.debug("Friend list did not become ready: %s", summary)
     # The chat page loaded but never exposed friend rows: a page/selector change,
     # not a transport failure.
     raise FriendRefreshError(
-        "friend list did not become ready within timeout; "
-        f"dom={summary}",
+        "抖音私信页已打开，但好友列表未加载完成",
         category=CATEGORY_STRUCTURE_CHANGED,
     )
 
@@ -658,8 +673,8 @@ async def _fetch_account_friends_once(
                     last_identity_error or RuntimeError("creator identity could not be read"),
                     classify_refresh_error(last_identity_error),
                 )
-            # Also require the friend private-message page to be readable, so a
-            # session that cannot reach the friend list is not reported healthy.
+            # Make sure the authenticated session can open the chat view.
+            # Friend rows are loaded and reported by the separate refresh job.
             await page.goto(CHAT_PAGE_URL, wait_until="commit", timeout=FRIEND_LIST_READY_TIMEOUT_SECONDS * 1000)
             await _wait_for_chat_or_login(page)
             if verify_browser_identity:
@@ -688,10 +703,10 @@ async def _fetch_account_friends_once(
                         "登录浏览器身份与已绑定账号不一致，已停止验证",
                         category=CATEGORY_IDENTITY_CONFLICT,
                     )
-                # An SPA shell alone is not a usable chat view. Read friend
-                # readiness only after proving whose browser session it is.
+                # A shell alone is insufficient. Require the real Friends tab
+                # after proving whose session it is; rows can load separately.
                 await _click_friends_tab(page)
-                await _wait_for_friend_rows_or_empty(page)
+                await _ensure_logged_in(page)
             return {
                 # Page text only (handle or UID); not an identity proof.
                 "unique_id": normalize_unique_id(identity.get("unique_id")),
@@ -757,7 +772,7 @@ async def _fetch_account_friends_once(
 
 
 async def verify_account_session(account, *, auth_only=False, network_mode=None):
-    """Verify a stored cookie set by actually loading the friend chat page.
+    """Verify a stored cookie set using the creator identity and chat view.
 
     Returns ``{"verified": True, "friends": [...], "identity": {...}}`` when the
     login state is usable. Raises :class:`FriendRefreshError` with a user
@@ -969,22 +984,21 @@ async def fetch_account_friends(account, on_progress=None):
                 "Friend refresh route=%s returned zero friends; trying next route",
                 network_mode,
             )
-        except FriendRefreshError as exc:
-            if exc.category in {CATEGORY_LOGIN_REQUIRED, CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
-                raise
-            last_error = exc
-            logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
-        except RuntimeError as exc:
-            category = classify_refresh_error(exc)
-            if category == CATEGORY_LOGIN_REQUIRED:
-                raise FriendRefreshError(str(exc), category=category) from exc
-            last_error = _with_category(exc, category)
-            logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
         except Exception as exc:
-            last_error = _with_category(exc, classify_refresh_error(exc))
-            logger.warning("Friend refresh route=%s failed; trying next route: %s", network_mode, exc)
+            category = getattr(exc, "category", None) or classify_refresh_error(exc)
+            if category in {CATEGORY_LOGIN_REQUIRED, CATEGORY_BROWSER_CLEANUP_BLOCKED, "browser_dialog_blocked"}:
+                if isinstance(exc, FriendRefreshError):
+                    raise
+                raise FriendRefreshError(str(exc), category=category) from exc
+            logger.warning("Friend refresh route=%s failed: %s", network_mode, exc)
+            if (
+                last_error is None
+                or category != CATEGORY_NETWORK_UNAVAILABLE
+                or classify_refresh_error(last_error) == CATEGORY_NETWORK_UNAVAILABLE
+            ):
+                last_error = _with_category(exc, category)
     raise FriendRefreshError(
-        f"friend refresh failed after routes {modes}: {last_error}",
+        str(last_error),
         category=classify_refresh_error(last_error),
-    )
+    ) from last_error
 

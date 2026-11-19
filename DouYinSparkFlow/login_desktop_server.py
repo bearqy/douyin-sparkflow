@@ -17,7 +17,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_p
 
 from core.login import collect_login_result
 from core.streak_state import AUTH_COOKIE_NAMES
-from core.login_interaction import InteractionError, LoginInteraction
+from core.login_interaction import InteractionError, LoginInteraction, sms_verification_step
 from core.browser_engine import (
     BrowserEngineError,
     check_engine_expectation,
@@ -673,6 +673,7 @@ class LoginDesktopManager:
         unique_id = ""
         current_url = ""
         login_state_known = True
+        verification_step = ""
 
         if not self.context or self._context_is_closed():
             await self._retire_closed_account_profile()
@@ -739,20 +740,20 @@ class LoginDesktopManager:
         if page:
             current_url = page.url
             if not self._page_operation_lock.locked():
-                try:
-                    result = await collect_login_result(page, self.context, timeout_ms=1000)
-                    logged_in = True
-                    username = result["username"]
-                    unique_id = result["unique_id"]
-                except Exception as exc:
-                    # The page may simply not expose the identity yet; reporting
-                    # "logged out" here made a just-finished QR scan look like a
-                    # failure and invited a duplicate save.
-                    login_state_known = False
-                    logger.warning(
-                        "Login state could not be collected from the login page: %s",
-                        type(exc).__name__,
-                    )
+                verification_step = await sms_verification_step(page)
+                if not verification_step:
+                    try:
+                        result = await collect_login_result(page, self.context, timeout_ms=1000)
+                        logged_in = True
+                        username = result["username"]
+                        unique_id = result["unique_id"]
+                    except Exception as exc:
+                        # The page may not expose an identity until it finishes logging in.
+                        login_state_known = False
+                        logger.warning(
+                            "Login state could not be collected from the login page: %s",
+                            type(exc).__name__,
+                        )
             else:
                 # The page is mid-operation (for example refreshing the QR code),
                 # so its state is genuinely unknown right now.
@@ -762,9 +763,11 @@ class LoginDesktopManager:
             "running": True,
             "logged_in": logged_in,
             "login_state": (
-                "logged_in" if logged_in else ("logged_out" if login_state_known else "unknown")
+                "verification_required" if verification_step
+                else "logged_in" if logged_in else "logged_out" if login_state_known else "unknown"
             ),
             "login_state_known": login_state_known,
+            **({"verification_step": verification_step} if verification_step else {}),
             "username": username,
             "unique_id": unique_id,
             "current_url": current_url,
@@ -854,6 +857,7 @@ class LoginDesktopManager:
                 self.page = page
             if action is not None:
                 await asyncio.wait_for(self.interaction.act(token, page, action), timeout=5)
+                self.mark_activity()
                 return {"ok": True}
             data = await self.interaction.screenshot(token, page)
             return {"ok": True, "image": base64.b64encode(data).decode("ascii")}
@@ -1300,6 +1304,8 @@ class LoginDesktopManager:
 
     async def _refresh_login_qr_locked(self):
         page = await self._get_active_page()
+        if step := await sms_verification_step(page):
+            return {"ok": False, "verification_step": step}
         explicit_account_reset = self._active_profile_mode == "account"
         if explicit_account_reset:
             # This method is reached only by the explicit refresh POST; passive
@@ -1512,7 +1518,7 @@ async def authenticate_internal_api(request: Request, call_next):
 
 def _qr_error(
     status_code, code, message, *, retry_after=None, logged_in=False, reset=False,
-    retryable=None, recovery=None,
+    retryable=None, recovery=None, verification_step=None,
 ):
     """Return a machine-readable QR result with a user-actionable reason."""
     headers = {"Cache-Control": "no-store"}
@@ -1530,9 +1536,17 @@ def _qr_error(
             "reset": bool(reset),
             **({"retry_after": int(retry_after)} if retry_after else {}),
             **({"recovery": dict(recovery)} if recovery else {}),
+            **({"verification_step": verification_step} if verification_step else {}),
         },
         status_code=status_code,
         headers=headers,
+    )
+
+
+def _sms_verification_response(step):
+    return _qr_error(
+        202, "qr_verification_required", "请在登录窗口完成抖音短信验证。",
+        retryable=False, verification_step=step,
     )
 
 
@@ -1676,6 +1690,8 @@ async def refresh_qr(request: Request):
         # Another request currently owns the login page.
         code, message = QR_ERROR_SPECS["qr_page_busy"]
         return _qr_error(code, "qr_page_busy", message, retry_after=2)
+    if step := payload.get("verification_step"):
+        return _sms_verification_response(step)
     if not payload.get("ok"):
         code, message = QR_ERROR_SPECS["qr_not_ready"]
         return _qr_error(
@@ -1712,6 +1728,8 @@ async def export(request: Request):
 
 async def _probe_login_qr(page):
     """One look at the login page: an expired notice, a QR image, a session, or nothing."""
+    if step := await sms_verification_step(page):
+        return "verification_required", step
     try:
         expired = await page.locator('[class*="qrcode_expired"]').count()
         expired_visible = bool(expired) and await page.locator('[class*="qrcode_expired"]').first.is_visible()
@@ -1797,6 +1815,8 @@ async def _read_login_qr(wait, interaction_key):
             break
         await asyncio.sleep(0.5)
 
+    if outcome == "verification_required":
+        return _sms_verification_response(data)
     if outcome == "expired":
         code, message = QR_ERROR_SPECS["qr_expired"]
         return _qr_error(code, "qr_expired", message)

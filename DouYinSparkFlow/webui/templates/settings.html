@@ -158,7 +158,7 @@
               <option value="mihomo" {% if app_settings.douyin_network_mode == "mihomo" %}selected{% endif %}>Mihomo（高级）</option>
             </select>
           </label>
-          <label class="field"><span>Mihomo 代理地址</span><input type="text" name="douyin_proxy_url" value="{{ app_settings.douyin_proxy_url|default("http://proxy:7890") }}" placeholder="http://proxy:7890"><small>仅在选择 Mihomo 时使用。</small></label>
+          <label class="field"><span>Mihomo 代理地址</span><input type="text" name="douyin_proxy_url" value="{{ app_settings.douyin_proxy_url|default("http://proxy:7890") }}" placeholder="http://proxy:7890"><small>直连失败时会尝试此代理。只用直连可留空。</small></label>
           <label class="field"><span>Web 控制台端口</span><input type="number" min="1" max="65535" name="ui_port" value="{{ app_settings.ui_port }}"></label>
         </div>
         <fieldset>

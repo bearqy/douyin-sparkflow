@@ -46,12 +46,8 @@ class BoundIdentityFallbackTests(unittest.TestCase):
 
         async def click_friends(page):
             self.chat_steps.append("friends-tab")
-
-        async def friend_rows(page):
-            self.chat_steps.append("friend-list")
             if chat_error:
                 raise chat_error
-            return "", None
 
         account = dict(self.account)
         if not bound:
@@ -61,7 +57,7 @@ class BoundIdentityFallbackTests(unittest.TestCase):
             patch.object(friends, "collect_login_result", side_effect=card),
             patch.object(friends, "fetch_trusted_identity", side_effect=read_identity) as probe,
             patch.object(friends, "_click_friends_tab", side_effect=click_friends),
-            patch.object(friends, "_wait_for_friend_rows_or_empty", side_effect=friend_rows),
+            patch.object(friends, "_wait_for_friend_rows_or_empty", side_effect=AssertionError("login check read friend rows")),
             patch.object(friends, "IDENTITY_READ_ATTEMPTS", 1),
             patch.object(friends._wait_for_chat_or_login, "__defaults__", (0.01,)),
         ):
@@ -82,7 +78,7 @@ class BoundIdentityFallbackTests(unittest.TestCase):
         self.assertEqual("saved-handle", result["display_id"])
         self.assertEqual([friends.CREATOR_HOME_URL, friends.CHAT_PAGE_URL], page.visited)
         self.assertEqual(1, calls)
-        self.assertEqual(["friends-tab", "friend-list"], self.chat_steps)
+        self.assertEqual(["friends-tab"], self.chat_steps)
 
     def test_another_browser_identity_is_rejected(self):
         with self.assertRaises(friends.FriendRefreshError) as caught:
@@ -100,9 +96,9 @@ class BoundIdentityFallbackTests(unittest.TestCase):
             self.run_check(page=_FakePage(sub_app_count=0))
         self.assertEqual(friends.CATEGORY_STRUCTURE_CHANGED, caught.exception.category)
 
-    def test_chat_shell_without_readable_friends_is_not_accepted(self):
+    def test_chat_shell_without_friends_tab_is_not_accepted(self):
         with self.assertRaises(friends.FriendRefreshError) as caught:
-            self.run_check(chat_error=friends.FriendRefreshError("friend list did not become ready"))
+            self.run_check(chat_error=friends.FriendRefreshError("未找到朋友私信标签"))
         self.assertEqual(friends.CATEGORY_STRUCTURE_CHANGED, caught.exception.category)
 
     def test_redirected_chat_page_is_not_accepted(self):

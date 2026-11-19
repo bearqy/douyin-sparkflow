@@ -33,6 +33,13 @@ class DouyinNetworkRouteTests(unittest.TestCase):
         self.assertEqual("direct", config_module.DEFAULT_APP_SETTINGS["douyin_network_mode"])
         self.assertEqual("http://proxy:7890", config_module.DEFAULT_APP_SETTINGS["douyin_proxy_url"])
 
+    def test_direct_only_when_proxy_address_is_empty(self):
+        settings = {"douyin_network_mode": "direct", "douyin_proxy_url": ""}
+        with patch.dict(browser.os.environ, clear=True), patch.object(
+            browser, "get_app_settings", return_value=settings
+        ):
+            self.assertEqual(("direct",), browser.douyin_network_modes())
+
     def test_default_ops_log_file_is_the_mounted_path(self):
         self.assertEqual(
             "/app/logs/douyin-sparkflow.log",

@@ -54,4 +54,6 @@ if ! python /app/scripts/ensure_novnc_metadata.py --web-root /usr/share/novnc; t
 fi
 run_forever novnc websockify --web=/usr/share/novnc "${LOGIN_DESKTOP_WEB_PORT}" "127.0.0.1:${LOGIN_DESKTOP_VNC_PORT}" &
 
+# Limit the external application guard to this login desktop and its browser.
+export PATH="/app/scripts/login-browser-bin:${PATH}"
 exec python /app/login_desktop_server.py

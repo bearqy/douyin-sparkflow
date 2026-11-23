@@ -1007,6 +1007,12 @@ class RuntimeHardeningTests(unittest.TestCase):
             async def add_cookies(self, cookies):
                 del cookies
 
+            async def route(self, *args, **kwargs):
+                del args, kwargs
+
+            async def route_web_socket(self, *args, **kwargs):
+                del args, kwargs
+
             async def new_page(self):
                 return self.page
 

@@ -6,7 +6,7 @@ from core import tasks
 
 
 class LoginCheckMinuteTests(unittest.IsolatedAsyncioTestCase):
-    async def test_actual_nested_login_check_has_two_sixty_second_guards(self):
+    async def test_actual_nested_login_check_has_two_ninety_second_guards(self):
         real_wait=asyncio.wait
         budgets=[]
         async def wait(operations, *, timeout=None, **kwargs):
@@ -19,7 +19,7 @@ class LoginCheckMinuteTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(tasks,'_body_text_sample',new=AsyncMock(return_value='')):
             await tasks._run_browser_stage('login_check',
                 tasks.ensure_not_login_required(page,'synthetic','open_chat_page'))
-        self.assertEqual(budgets,[60,60])
+        self.assertEqual(budgets,[90,90])
 
     async def test_other_stages_and_explicit_budgets_do_not_change(self):
         real_wait=asyncio.wait

@@ -19,7 +19,7 @@ class TemplateScopeTests(unittest.TestCase):
         client=self.fixture.login('owner','Owner-secret-2026!')
         response=client.get('/settings')
         self.assertEqual(200,response.status_code)
-        self.assertIn('已在“我的续火花”保存个人发送内容的用户，优先使用个人内容',response.text)
+        self.assertIn('已保存个人内容时，只使用个人内容，不与全局模板混用',response.text)
 
     def test_personal_message_does_not_expand_api_or_use_global_variants_and_holidays(self):
         principal={'username':'alice','role':'user'}

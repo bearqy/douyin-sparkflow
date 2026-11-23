@@ -46,6 +46,13 @@ def test_refusal_lifecycle_waits_reserves_and_finishes():
         assert recovery_queue.due(saved, "Alice", cn(11, 45))
         token = recovery_queue.reserve(saved, "Alice", cn(11, 45), "run-1")
         assert token["sequence"] == 1
+        # Keep the claim live while it is being checked and finished: a claim
+        # with no matching in-flight/outcome state is a fossil and releases.
+        saved.setdefault("target_states", {})["peer:100"] = {
+            "status": "in_flight",
+            "runId": "run-1",
+            "leaseExpiresAt": cn(23).isoformat(),
+        }
         assert recovery_queue.reservation_matches(saved, "Alice", cn(11, 46), "run-1", token)
         assert recovery_queue.finish_target(saved, "Alice", cn(11, 46))["state"] == "done"
         assert not recovery_queue.due(saved, "Alice", cn(12))
@@ -75,12 +82,20 @@ def test_json_roundtrip_and_same_source_only_draws_wait_once():
 
 def test_explicit_refusals_can_retry_more_than_five_times_but_claim_cannot_repeat():
     saved = account()
+    states = saved.setdefault("target_states", {})
     with patch.object(recovery_queue, "get_config", return_value=CONFIG), patch.object(recovery_queue.random, "randint", return_value=45):
         for number in range(7):
             source = local(10 + number)
             recovery_queue.schedule_target(saved, "Alice", source, source, "refusal")
             token = recovery_queue.reserve(saved, "Alice", source + timedelta(minutes=45), f"run-{number}")
             assert token and token["sequence"] == number + 1
+            # A live in-flight lease keeps the claim owned; without it the row
+            # is a fossil claim and releases back to waiting for "other".
+            states["peer:100"] = {
+                "status": "in_flight",
+                "runId": f"run-{number}",
+                "leaseExpiresAt": local(23).isoformat(),
+            }
             assert recovery_queue.reserve(saved, "Alice", source + timedelta(minutes=46), "other") is None
 
 
@@ -135,8 +150,25 @@ def test_reconciliation_cannot_unlock_an_unresolved_claim():
     saved, source = account(), local(11)
     with patch.object(recovery_queue, 'get_config', return_value=CONFIG):
         assert recovery_queue.reserve(saved, 'Alice', source, 'crashed', first=True)
+        # The claim is only locked while its run owns a live or recorded
+        # outcome; give the crashed run a durable in-flight lease.
+        saved.setdefault("target_states", {})["peer:100"] = {
+            "status": "in_flight",
+            "runId": "crashed",
+            "leaseExpiresAt": local(23).isoformat(),
+        }
         assert recovery_queue.schedule_target(saved, 'Alice', local(17), local(17), 'unsent') is None
         assert recovery_queue.target_entry(saved, 'Alice', local(17))['state'] == 'claimed'
+
+
+def test_fossil_claim_without_live_state_releases_to_waiting():
+    saved, source = account(), local(11)
+    with patch.object(recovery_queue, 'get_config', return_value=CONFIG):
+        assert recovery_queue.reserve(saved, 'Alice', source, 'crashed', first=True)
+        # No matching in-flight lease or recorded outcome: the dead claim
+        # releases and a later unsent schedule may take over.
+        row = recovery_queue.schedule_target(saved, 'Alice', local(17), local(17), 'unsent')
+        assert row['state'] == 'waiting' and row['kind'] == 'unsent'
 
 
 def test_first_claim_cannot_bypass_an_existing_retry_deadline():
@@ -173,6 +205,13 @@ def test_immediate_proven_first_refusal_can_share_the_claim_second():
     saved, source = account(), local(11)
     with patch.object(recovery_queue, 'get_config', return_value=CONFIG), patch.object(recovery_queue.random, 'randint', return_value=45) as random_wait:
         recovery_queue.reserve(saved, 'Alice', source, 'fast', first=True)
+        # Keep the first claim live so the same-second refusal shares its
+        # claim second instead of releasing the row as a fossil.
+        saved.setdefault("target_states", {})["peer:100"] = {
+            "status": "in_flight",
+            "runId": "fast",
+            "leaseExpiresAt": local(23).isoformat(),
+        }
         row = recovery_queue.schedule_target(saved, 'Alice', source, source, 'refusal')
         assert row['state'] == 'waiting' and row['kind'] == 'refusal'
         recovery_queue.schedule_target(saved, 'Alice', source, source, 'refusal')

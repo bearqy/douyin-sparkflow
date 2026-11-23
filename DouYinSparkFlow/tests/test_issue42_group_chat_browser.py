@@ -369,7 +369,13 @@ class BoundGroupRelocationIsolationTests(unittest.TestCase):
     def test_target_lost_during_relocation_fails_only_that_target(self):
         page = object()
         errors = []
+
+        async def _legacy(page, *args, **kwargs):
+            return False
+
         with (
+            patch.object(tasks.im_ui, "is_saas_ui", new=_legacy),
+            patch.object(tasks.im_ui, "wait_for_saas_ui", new=_legacy),
             patch.object(tasks, "_open_groups_tab", new=AsyncMock()),
             patch.object(tasks, "_wait_for_friend_list_ready", new=AsyncMock(return_value=("rows", None))),
             patch.object(tasks, "_first_scrollable_friends_element", new=AsyncMock(return_value=("grid", "grid"))),

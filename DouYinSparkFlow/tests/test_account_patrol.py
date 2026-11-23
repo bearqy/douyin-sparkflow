@@ -1168,6 +1168,9 @@ class PatrolCancellationAndPushTests(unittest.TestCase):
             stack.enter_context(patch.object(patrol, "release_browser_account_lock", side_effect=release))
             stack.enter_context(patch.object(patrol, "douyin_network_modes", return_value=["direct"]))
             stack.enter_context(patch.object(patrol, "account_timeout_seconds", return_value=0.01))
+            # The retry gate refuses a shorter budget than MIN_RETRY_BUDGET_SECONDS;
+            # scale the floor down so the tiny test timeout still starts one attempt.
+            stack.enter_context(patch.object(patrol, "MIN_RETRY_BUDGET_SECONDS", 0.001))
             result = asyncio.run(patrol.patrol_account(
                 account,
                 now=NOW,

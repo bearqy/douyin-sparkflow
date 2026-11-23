@@ -66,7 +66,7 @@ class PR62LiveGuardIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(sender.count("_persist_browser_pre_enter_unknown("), 2)
         self.assertIn("await _require_friend_chat(page, user, target_name, arm=True)", sender)
         self.assertIn("Stopping before send because personal authorization changed", sender)
-        self.assertIn("_dispatch_browser_enter_if_current(user, chat_input)", sender)
+        self.assertIn("_dispatch_browser_enter_if_current(user, chat_input, target_name)", sender)
         self.assertIn("generator.__anext__()", scan)
 
         dispatch = function_source(tasks_tree, tasks_text, "_dispatch_browser_enter_if_current")

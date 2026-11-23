@@ -75,6 +75,8 @@ class AccountRecordRefRoutingTests(unittest.TestCase):
 
         page = self.alice.get("/ops/send-console")
         self.assertIn('action="/accounts/111/release-reply-wait"', page.text)
+        self.assertIn('data-overview-value="waitingForReply">1</b>', page.text)
+        self.assertIn('待对方回复或互关（7467）', page.text)
         with (
             patch.object(app_module, "run_browser_tasks", new_callable=AsyncMock) as browser,
             patch.object(app_module, "run_protocol_tasks", new_callable=AsyncMock) as protocol,

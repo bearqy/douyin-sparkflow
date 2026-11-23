@@ -76,7 +76,13 @@ class MobileLayoutTests(unittest.TestCase):
                                 })""")
                                 self.assertLessEqual(measurements["scroll"], width + 1, measurements)
                                 if principal and principal["role"] == "admin" and path.startswith("/settings"):
-                                    self.assertEqual(1, page.locator("section.settings-section:visible").count())
+                                    # An anchored link still lands on one panel; a bare
+                                    # /settings visit shows the overview nav on small
+                                    # screens and the first panel on wide ones.
+                                    if "_anchor=" in path or width > 1100:
+                                        self.assertEqual(1, page.locator("section.settings-section:visible").count())
+                                    else:
+                                        self.assertEqual(0, page.locator("section.settings-section:visible").count())
                                 if width <= 430:
                                     small_inputs = page.locator('input:not([type="hidden"]):not([type="checkbox"]), textarea, select').evaluate_all(
                                         "items => items.filter(el => parseFloat(getComputedStyle(el).fontSize) < 16).length"

@@ -256,13 +256,16 @@ class RecoveryCallerTests(unittest.TestCase):
             row = Q.target_entry(json.loads(path.read_text())[0], 'friend', NOW)
             self.assertEqual(row['kind'], 'unsent')
 
-    def test_global_run_selects_only_one_ordinary_target_before_refusal(self):
+    def test_global_run_batches_due_targets_and_skips_cooling_or_held_targets(self):
         from core import automatic_recovery as A, streak_state
         from tests.test_refusal_retry import account as rejected
         now = NOW.replace(hour=16)
         user = self.fresh()
-        user['targets'] = ['friend', 'ordinary', '群聊:7691234567890123401']
-        refused_at = now-timedelta(minutes=100)
+        user['targets'] = ['friend', 'ordinary', 'held', '群聊:7691234567890123401']
+        streak_state.mark_waiting_for_reply(user, 'held', now - timedelta(days=1))
+        # The refusal row is scheduled 45-90 minutes out; 10 minutes ago is
+        # still inside the wait, so the reconciliation cannot make it due.
+        refused_at = now-timedelta(minutes=10)
         streak_state.mark_failed(user, 'friend', category='send_rejected', reason='synthetic', retryable=False, now=refused_at)
         user['failure_queue'] = deepcopy(rejected()['failure_queue'])
         user['failure_queue']['friend']['lastAttemptAt'] = refused_at.isoformat()
@@ -276,8 +279,11 @@ class RecoveryCallerTests(unittest.TestCase):
             sender.assert_awaited_once()
             selected = sender.await_args.args[1]
             self.assertEqual(len(selected), 1)
-            self.assertEqual(len(selected[0]['targets']), 1)
-            self.assertNotEqual(selected[0]['targets'], ['friend'])
+            # Every due target of the winning account is batched into one pass;
+            # skip both the refusal inside its random wait and the 7467 hold.
+            self.assertEqual(
+                sorted(selected[0]['targets']),
+                sorted(['ordinary', '群聊:7691234567890123401']))
             self.assertFalse(sender.await_args.args[0]['multiTask'])
 
     def test_initial_page_failure_closes_before_random_account_cooldown_without_claim(self):

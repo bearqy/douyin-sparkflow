@@ -63,8 +63,15 @@ class SenderMessageHistoryTests(unittest.TestCase):
                               'newer stable message')
 
     def test_group_history_remains_compatible(self):
-        self._assert_previous({'群聊：111': self._entry('previous group message')},
-                              'previous group message', target='群聊：111')
+        # Group targets take the dedicated group-selection path rather than
+        # the friend chat locator, so only the history lookup is asserted.
+        with flow() as (user, page, context, browser, chat, release, run):
+            user['targets'] = ['群聊：111']
+            user['target_uid_bindings'] = {'群聊：111': {'uid': '10001', 'secUid': 'synthetic-sec-first'}}
+            user['message_history'] = {'群聊：111': self._entry('previous group message')}
+            with patch.object(tasks, 'build_message', return_value='new message') as build:
+                asyncio.run(run())
+            self.assertEqual(build.call_args.kwargs['previous_message'], 'previous group message')
 
     def test_missing_history_starts_with_empty_previous(self):
         self._assert_previous({}, '')

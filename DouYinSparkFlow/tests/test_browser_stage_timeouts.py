@@ -37,7 +37,10 @@ def flow(*, identity_guard=False):
                 "messageIntervalSecondsMax": 0}
 
     async def selected(*args, **kwargs):
-        for target in args[3]:
+        # scroll_and_select_user passes targets positionally at args[3];
+        # scroll_and_select_group_targets passes them at args[2].
+        targets = args[3] if len(args) > 3 and isinstance(args[3], (list, tuple)) else args[2]
+        for target in targets:
             editor['text'] = ''
             yield target
 
@@ -67,6 +70,9 @@ def flow(*, identity_guard=False):
             "ensure_not_login_required": AsyncMock(),
             "_page_has_login_required_prompt": AsyncMock(return_value=(False, "")),
             "scroll_and_select_user": selected,
+            # Group targets take their own selection path; this fixture skips
+            # the DOM scan the same way as the friend path above.
+            "scroll_and_select_group_targets": selected,
             "locate_chat_input": AsyncMock(return_value=(chat, "input")),
             "snapshot_last_own_message": AsyncMock(return_value=None),
             "build_message": Mock(return_value="offline message"),
@@ -347,7 +353,12 @@ def test_nested_login_timeout_drains_cancellation_resistant_probe():
         page.locator.return_value.first.count = AsyncMock(side_effect=stubborn)
         errors = []
         asyncio.get_running_loop().set_exception_handler(lambda loop, context: errors.append(context))
-        with patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01):
+        async def _legacy(_page, *args, **kwargs):
+            return False
+        with patch.object(tasks.im_ui, "is_saas_ui", new=_legacy), \
+                patch.object(tasks.im_ui, "wait_for_saas_ui", new=_legacy), \
+                patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01), \
+                patch.object(tasks, "BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS", .01):
             with unittest.TestCase().assertRaises(tasks.BrowserStageTimeout):
                 await tasks._run_browser_stage("login_check", tasks.ensure_not_login_required(page, "synthetic", "offline"))
         await asyncio.sleep(0)
@@ -359,7 +370,11 @@ def test_nested_login_timeout_drains_cancellation_resistant_probe():
 def test_direct_last_message_read_is_bounded():
     async def exercise():
         page = Mock(evaluate=AsyncMock(side_effect=hangs))
-        with patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01):
+        async def _legacy(_page, *args, **kwargs):
+            return False
+        with patch.object(tasks.im_ui, "is_saas_ui", new=_legacy), \
+                patch.object(tasks.im_ui, "wait_for_saas_ui", new=_legacy), \
+                patch.object(tasks, "BROWSER_STAGE_TIMEOUT_SECONDS", .01):
             with unittest.TestCase().assertRaises(tasks.BrowserStageTimeout):
                 await tasks.snapshot_last_own_message(page)
     # An outer watchdog makes the pre-fix test fail instead of waiting forever.

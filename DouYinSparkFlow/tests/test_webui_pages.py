@@ -204,7 +204,7 @@ class RedesignedPagesTests(unittest.TestCase):
 
         page = self._get("/accounts").text
 
-        self.assertIn('data-patrol-pill="ok">巡查正常</span>', page)
+        self.assertIn('data-patrol-conclusion="ok">正常</span>', page)
         for label in ("群聊：已找到", "新群名", "群聊：缺失", "群聊：未核对", "群聊：重名"):
             with self.subTest(label=label):
                 self.assertIn(label, page)
@@ -276,14 +276,12 @@ class RedesignedPagesTests(unittest.TestCase):
         self.assertNotIn("已绑定群\n", page)
         self.assertNotIn('\\u003cimg src=x onerror=alert(1)\\u003e', page)
         self.assertNotIn('<img src=x onerror=alert(1)>', page)
-        self.assertIn('id="groups-cache-ref-1">[]</script>', page)
         self.assertIn('/accounts/1001/picker-cache?ref=ref-1&amp;generation=generation-ref-1', page)
         self.assertIn('name="group_targets"', page)
         self.assertIn('data-group-targets="true"', page)
         self.assertIn("同名会话", page)
-        self.assertIn("保存时会统一为“群聊：群名称”", page)
-        self.assertIn("同名好友与群聊可以同时保留", page)
-        self.assertIn("不代表群火花已成功", page)
+        self.assertIn("好友与群聊分别保存", page)
+        self.assertIn("群火花状态请以发送明细为准", page)
         self.assertIn("const isGroupTarget", script)
         # Typing in the group box must not be rewritten mid-input (it used to
         # drop newlines); the server normalizes group targets on save.

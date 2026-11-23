@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 
 from core.browser import (account_profile_name, acquire_browser_account_lock, douyin_network_modes,
     first_scrollable_element, get_browser, get_persistent_browser_context, normalize_persistent_profile_config, release_browser_account_lock)
+from core import im_ui
 from core.friends import (CATEGORY_BROWSER_CLEANUP_BLOCKED, CHAT_PAGE_URL,
     FriendRefreshError, _wait_for_chat_or_login, browser_account_cleanup_blocked,
     retain_browser_account_lock_for_cleanup)
@@ -43,7 +44,12 @@ async def _activate_group_tab(page, timeout_ms=20000):
 
     Returns the previously selected tab name so the caller can restore it.
     """
-    old = (await page.locator('[role=tab][aria-selected=true]').first.inner_text()).strip()
+    try:
+        old = (await page.locator('[role=tab][aria-selected=true]').first.inner_text(timeout=timeout_ms)).strip()
+    except Exception as exc:
+        # The new SaaS page has no role tabs at all; callers must not wait the
+        # locator's default 30s before falling back to the 群聊 filter.
+        raise RuntimeError('群消息标签未激活') from exc
     tab = page.get_by_role('tab', name='群消息', exact=True)
     try:
         await tab.wait_for(state='visible', timeout=timeout_ms)
@@ -62,6 +68,70 @@ async def _activate_group_tab(page, timeout_ms=20000):
 
 GROUP_ROW_SELECTOR = '#sub-app li.semi-list-item'
 GROUP_SCROLL_SELECTOR = '#sub-app [role="grid"], #sub-app .ReactVirtualized__Grid, #sub-app [class*="semi-list"] ul, #scroll'
+
+# New IM SaaS group rows: same data-e2e marker as friend rows, but the group
+# filter tag is 群聊 under the 消息 group.
+SAAS_GROUP_SCROLL_SELECTORS = im_ui.SAAS_SCROLL_SELECTORS
+
+
+async def _read_saas_group_row(row):
+    """Never pair a stale virtual row id with a newly recycled display name."""
+    from core import saas_group_guard
+    snapshot = await saas_group_guard.read_row_snapshot(row)
+    if not snapshot:
+        return None, ""
+    return snapshot["conversationId"], snapshot["name"]
+
+
+async def collect_saas_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=.1):
+    """Passively exhaust the SaaS group-filtered virtual list; never click a row."""
+    _, scroll = await first_scrollable_element(page, list(SAAS_GROUP_SCROLL_SELECTORS))
+    if not scroll:
+        raise RuntimeError('未找到群列表滚动容器')
+    reset_top = await page.evaluate('(element) => { element.scrollTop = 0; return element.scrollTop; }', scroll)
+    if reset_top != 0:
+        raise RuntimeError('群列表滚动位置无法复位')
+    # Let the virtual list mount its first page before the first read; rows
+    # that materialise later are picked up by the stability passes below.
+    await asyncio.sleep(scroll_delay_seconds)
+    deadline = asyncio.get_running_loop().time() + max_scan_seconds
+    result, seen = [], set()
+    # Bottom-reaching passes that added nothing. One quiet pass is not proof:
+    # the virtual list lazy-renders pages and may still have unfetched rows,
+    # so completion needs two consecutive stable reads at the bottom.
+    quiet_bottom_passes = 0
+    while True:
+        if asyncio.get_running_loop().time() > deadline:
+            raise RuntimeError('群列表读取超时')
+        added = 0
+        for row in await page.locator(im_ui.SAAS_ROW_SELECTOR).all():
+            if not await row.is_visible():
+                continue
+            from core import saas_group_guard
+            metadata = await saas_group_guard.read_row_metadata(row)
+            if metadata and metadata["type"] in {1, 3, 4, 17}:
+                continue
+            conversation_id = metadata.get("conversationId") if metadata and metadata["type"] == 2 else None
+            name = metadata.get("name", "") if metadata else ""
+            if not conversation_id:
+                raise RuntimeError('visible group row has no conversation id')
+            if conversation_id not in seen:
+                if not name:
+                    raise RuntimeError('visible group row has no name')
+                seen.add(conversation_id)
+                result.append({'name': name, 'conversationId': conversation_id})
+                added += 1
+        state = await page.evaluate('''async e => { e.scrollTop += Math.max(1,e.clientHeight); await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))); return {top:e.scrollTop, client:e.clientHeight, height:e.scrollHeight} }''', scroll)
+        await asyncio.sleep(scroll_delay_seconds)
+        at_bottom = state['top'] + state['client'] >= state['height'] - 1
+        if at_bottom and not added:
+            quiet_bottom_passes += 1
+            if quiet_bottom_passes >= 2:
+                if not result:
+                    raise RuntimeError('未读到群列表')
+                return result
+        else:
+            quiet_bottom_passes = 0
 
 async def collect_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=.1):
     """Passively exhaust virtualized visible rows; never click a conversation."""
@@ -95,6 +165,56 @@ async def collect_group_rows(page, *, max_scan_seconds=60, scroll_delay_seconds=
                 raise RuntimeError('未读到群列表')
             return result
 
+async def _legacy_group_ui_present(page):
+    """True once the legacy 群消息 tab or legacy group rows are really there."""
+    try:
+        if await page.get_by_role('tab', name='群消息', exact=True).count() > 0:
+            return True
+        for row in await page.locator(GROUP_ROW_SELECTOR).all():
+            if await row.is_visible():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+async def _wait_for_visible_rows(page, selector, *, timeout_seconds=20):
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        if any([await row.is_visible() for row in await page.locator(selector).all()]):
+            return
+        await asyncio.sleep(.1)
+    raise RuntimeError('未读到群列表')
+
+
+async def collect_groups_on_chat_page(page, *, timeout_ms=20000):
+    """Read the group list on an already-open creator chat page.
+
+    Routes to the SaaS 群聊 filter on the new IM page and keeps the legacy
+    群消息 tab path for the old one, so a caller never has to guess the page
+    generation. Only switches the list filter and scrolls it; never opens a
+    conversation, so nothing is marked read or sent.
+    """
+    if await im_ui.wait_for_saas_ui(
+        page, timeout_ms=timeout_ms, legacy_probe=lambda: _legacy_group_ui_present(page)
+    ):
+        activated = await im_ui.activate_saas_filter(page, 'group')
+        if not activated:
+            raise RuntimeError('新版 IM 群聊筛选状态无法确认')
+        await _wait_for_visible_rows(page, im_ui.SAAS_ROW_SELECTOR)
+        return await collect_saas_group_rows(page)
+    previous = await _activate_group_tab(page)
+    try:
+        await _wait_for_visible_rows(page, GROUP_ROW_SELECTOR)
+        return await collect_group_rows(page)
+    finally:
+        if previous:
+            try:
+                await page.get_by_role('tab', name=previous, exact=True).click()
+            except Exception:
+                pass
+
+
 async def fetch_account_groups(account):
     """Open the account profile, select 群消息, scan only DOM facts, and restore tab."""
     cookies = list(account.get('cookies') or [])
@@ -122,29 +242,21 @@ async def fetch_account_groups(account):
         else:
             playwright, browser = await get_browser(GUI=False, network_mode=mode, profile_name=account_profile_name(account)); context = await browser.new_context(); await context.add_cookies(cookies)
         async def guard_write_routes(route):
-            if refresh_request_allowed(route.request.method, route.request.url):
+            method = route.request.method
+            url = route.request.url
+            if (refresh_request_allowed(method, url)
+                    or im_ui.saas_request_allowed(method, url)):
                 await route.continue_()
             else:
                 await route.abort()
 
         await context.route('**/*', guard_write_routes)
+        await context.route_web_socket('**/*', im_ui.deny_refresh_socket)
         page = await context.new_page(); await page.goto(CHAT_PAGE_URL, wait_until='commit', timeout=60000); await _wait_for_chat_or_login(page)
-        old = await _activate_group_tab(page)
-        deadline = asyncio.get_running_loop().time() + 20
-        while asyncio.get_running_loop().time() < deadline:
-            rows = page.locator(GROUP_ROW_SELECTOR)
-            if any([await row.is_visible() for row in await rows.all()]):
-                break
-            await asyncio.sleep(.1)
-        else:
-            raise RuntimeError('未读到群列表')
-        rows = await collect_group_rows(page)
-        if old:
-            try: await page.get_by_role('tab', name=old, exact=True).click()
-            except Exception: pass
+
         # Reading group rows is not an account-identity proof. Do not publish
         # this profile's cookies into the account store from a list-only job.
-        return rows
+        return await collect_groups_on_chat_page(page)
     finally:
         try:
             cancelled = False

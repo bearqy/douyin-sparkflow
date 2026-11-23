@@ -964,6 +964,12 @@ class WebFriendRefreshUidTests(unittest.TestCase):
             async def add_cookies(self, cookies):
                 pass
 
+            async def route(self, *args, **kwargs):
+                pass
+
+            async def route_web_socket(self, *args, **kwargs):
+                pass
+
             async def new_page(self):
                 return page
 

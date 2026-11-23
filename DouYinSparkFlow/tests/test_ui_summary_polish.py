@@ -129,16 +129,29 @@ class UiSummaryPolishBrowserTests(unittest.IsolatedAsyncioTestCase):
 class SendConsoleTemplateSemanticsTests(unittest.TestCase):
     def test_first_render_weak_evidence_is_not_a_green_success(self):
         text=TEMPLATE.read_text(encoding='utf-8')
-        self.assertIn('summary.today_page_echo_targets', text[text.index('data-today-summary')-400:text.index('data-today-summary')])
-        self.assertIn('summary.today_receipt_only_targets', text[text.index('data-today-summary')-400:text.index('data-today-summary')])
+        # The sent metric separates strong confirmations from the two
+        # weak-evidence kinds instead of presenting all of them as green.
+        self.assertIn(
+            'data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets + summary.today_receipt_only_targets }}',
+            text,
+        )
+        self.assertIn(
+            'data-overview-value="weakSent">{{ summary.today_page_echo_targets + summary.today_receipt_only_targets }}',
+            text,
+        )
 
     def test_attention_count_does_not_promise_retry_of_every_unknown(self):
         templates = ROOT / 'webui/templates'
-        for name in ('dashboard.html', 'settings.html', 'send_console.html'):
+        wording = {
+            'dashboard.html': '结果不明的目标不会自动重发',
+            'settings.html': '结果不明的目标不会自动重发',
+            'send_console.html': '结果显示不明的不会自动重发',
+        }
+        for name, phrase in wording.items():
             with self.subTest(name=name):
                 text=(templates/name).read_text(encoding='utf-8')
                 self.assertNotIn('将补发 {{',text)
-                self.assertIn('结果不明的目标不会自动重发',text)
+                self.assertIn(phrase,text)
 
     def test_sent_total_counts_both_weak_evidence_kinds(self):
         template = TEMPLATE.read_text(encoding="utf-8")
@@ -147,9 +160,12 @@ class SendConsoleTemplateSemanticsTests(unittest.TestCase):
             'data-overview-value="sentTotal">{{ summary.today_confirmed_targets + summary.today_page_echo_targets + summary.today_receipt_only_targets }}',
             template,
         )
-        self.assertIn("已发送（今日，含弱证据）", template)
-        self.assertIn("弱证据：仅页面回显", template)
-        self.assertIn("仅回执未确认", template)
+        self.assertIn("已确认发送", template)
+        self.assertIn("弱证据", template)
+        self.assertIn(
+            "summary.today_page_echo_targets + summary.today_receipt_only_targets",
+            template,
+        )
 
 
 if __name__ == "__main__":

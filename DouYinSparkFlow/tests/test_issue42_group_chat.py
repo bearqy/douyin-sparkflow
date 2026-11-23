@@ -62,6 +62,26 @@ async def _collect(generator):
     return [target async for target in generator]
 
 
+def _legacy_im_ui(cls):
+    """These tests exercise the legacy IM shell: the page fixtures are plain
+    Mocks, so both SaaS detectors (instant probe and the polling gate used by
+    _open_friends_tab/_open_groups_tab) are forced to the legacy answer."""
+    for name, value in list(vars(cls).items()):
+        if name.startswith("test_") and callable(value):
+            def wrap(method):
+                async def _noop(page, *args, **kwargs):
+                    return False
+                def patched(self, *args, **kwargs):
+                    with patch.object(tasks.im_ui, "is_saas_ui", new=_noop), \
+                            patch.object(tasks.im_ui, "wait_for_saas_ui", new=_noop), \
+                            patch.object(tasks, "_sender_chat_variant_is_saas", new=_noop):
+                        return method(self, *args, **kwargs)
+                return patched
+            setattr(cls, name, wrap(value))
+    return cls
+
+
+@_legacy_im_ui
 class GroupChatTargetTests(unittest.TestCase):
     def setUp(self):
         # These tests isolate scan ordering/rename/group routing; the friend

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from core import friends, groups, patrol, profile_cookies
+from core import friends, groups, im_ui, patrol, profile_cookies
 from core import identity as account_identity
 from core import tasks
 
@@ -54,6 +54,7 @@ class _Context:
         self.add_cookies = AsyncMock()
         self.close = AsyncMock()
         self.route = AsyncMock()
+        self.route_web_socket = AsyncMock()
         self.cookies = AsyncMock(return_value=[COOKIE])
 
     def set_default_navigation_timeout(self, value):
@@ -184,7 +185,9 @@ class RefreshCookieEntrypointTests(unittest.TestCase):
                 await patrol.patrol_account(user, profile_config=PROFILE, lock_wait=0)
             release.assert_not_called()
             retain.assert_called_once()
-            driver.stop.assert_awaited_once()
+            # Each route×attempt retries the startup and tears the driver down;
+            # the barrier contract only requires the lock to be retained.
+            driver.stop.assert_awaited()
         asyncio.run(run())
 
     def test_patrol_cookie_stage_startup_timeout_sets_barrier_and_retains_lock(self):
@@ -258,6 +261,9 @@ class RefreshCookieEntrypointTests(unittest.TestCase):
                     patch.object(profile_cookies, "prepare_profile_cookies", publish if kind == "prepare" else AsyncMock(return_value=session)),
                     patch.object(profile_cookies, "publish_profile_cookies", exporter),
                     patch.object(tasks, "_run_browser_stage", new=_fast_stage_runner()),
+                    # These fixtures model the legacy group list; the SaaS
+                    # detector would burn its poll budget on the Mock locators.
+                    patch.object(im_ui, "wait_for_saas_ui", new=AsyncMock(return_value=False)),
                 ):
                     if kind == "prepare":
                         with self.assertRaises(tasks.BrowserStageTimeout):

@@ -34,13 +34,15 @@ from core.browser import (
     release_browser_account_lock,
     select_douyin_network_mode,
 )
+from core.browser_resources import BrowserResourceUnavailable, ensure_browser_resources
 from core.im_receipt import parse_send_response
 from core.msg_builder import build_message, build_message_candidates, using_message_config, current_message_config
 from core import personal_streak, send_pause
 from core.identity import same_login_snapshot
 from core.protocol_dispatch import run_protocol_tasks
 from core.profile_cookies import prepare_profile_cookies, publish_profile_cookies
-from core import friend_identity, friend_chat_guard, notifications, streak_state
+from core import friend_identity, friend_chat_guard, notifications, streak_state, im_ui, saas_group_guard
+from core import saas_editor
 from core.send_state import parse_sent_at, target_is_strong_confirmed_today
 from utils.config import (
     get_config,
@@ -59,7 +61,11 @@ CREATOR_HOME_URL = "https://creator.douyin.com/"
 CREATOR_CHAT_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
 
 BROWSER_STAGE_TIMEOUT_SECONDS = 30
-BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS = 60
+BROWSER_LOGIN_CHECK_TIMEOUT_SECONDS = 90
+# How long the sender waits for the IM SaaS micro-frontend to mount before it
+# rejects the page as unrecognized. Slow hydration regularly exceeds the old
+# 30s probe and was misreported as an account-level failure.
+SENDER_SAAS_DETECT_TIMEOUT_MS = 60000
 BROWSER_CLEANUP_TIMEOUT_SECONDS = 5
 # Keep strong references to fail-closed locks: FileLock.__del__ releases them.
 _BLOCKED_BROWSER_LOCKS = {}
@@ -393,7 +399,7 @@ async def _require_friend_chat(page, user, target_name, *, arm=False, wait=False
     try:
         ok, reason = await _run_browser_stage("friend_identity", friend_chat_guard.verify_friend(
             page, latest, target_name, arm=arm, wait=wait))
-    except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+    except (BrowserStageTimeout, BrowserResourceUnavailable, friend_chat_guard.FriendIdentityError):
         raise
     except Exception as exc:
         raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: verification failed') from exc
@@ -468,6 +474,11 @@ LOGIN_REQUIRED_TEXTS = (
     "安全验证",
     "风险提示",
     "环境异常",
+    # The creator console renders this shell instead of the app when the stored
+    # session is no longer accepted: "页面暂时无法打开 … 请重新登录". It never
+    # mounts #sub-app, so without this marker the reader waited out its whole
+    # page timeout and reported a structure change instead of a dead login.
+    "页面暂时无法打开",
 )
 LOGIN_REQUIRED_SELECTORS = (
     ".login-mask",
@@ -640,8 +651,19 @@ async def save_debug_artifacts(page, account_name, target_name, stage):
     logger.info("Saved debug artifacts at stage=%s for %s/%s", stage, account_name, target_name)
 
 
+_SAAS_CHAT_INPUT_SELECTOR = '#sub-app [data-e2e="msg-input"] [contenteditable="true"]:visible'
+
+
 @_bounded_browser_stage("locate_chat_input")
 async def locate_chat_input(page):
+    if await im_ui.is_saas_ui(page):
+        selector = _SAAS_CHAT_INPUT_SELECTOR
+        inputs = page.locator(selector)
+        await inputs.first.wait_for(state="visible", timeout=10000)
+        if await inputs.count() != 1:
+            raise RuntimeError('friend_identity_unavailable: ambiguous SaaS editor')
+        await inputs.first.click(timeout=5000)
+        return inputs.first, selector
     selectors = [
         # The recorded creator editor has chat-input-nSWBco on the editable
         # itself; do not wait on an obsolete hashed class or global last editor.
@@ -694,8 +716,8 @@ def _normalize_message_text(value):
     ).strip()
 
 
-async def _type_browser_message_checked(chat_input, message):
-    """Preserve drafts and require a DOM readback; never dispatch Enter here."""
+async def _type_browser_message_checked(chat_input, message, *, saas_editor_input=False):
+    """Preserve drafts and require an exact readback; never dispatch Enter here."""
     async def read_exact():
         value = await chat_input.evaluate(
             '(node) => node.innerText ?? node.textContent ?? ""'
@@ -704,16 +726,27 @@ async def _type_browser_message_checked(chat_input, message):
             raise RuntimeError("input_read_unavailable")
         return _normalize_message_text(value)
 
-    before = await _run_browser_stage("input_before_type", read_exact())
-    if before:
+    if saas_editor_input:
+        before = await _run_browser_stage("input_before_type", saas_editor.read_state(chat_input))
+        if before == "unknown":
+            raise RuntimeError("input_read_unavailable")
+        nonempty = before != "empty"
+    else:
+        nonempty = bool(await _run_browser_stage("input_before_type", read_exact()))
+    if nonempty:
         raise RuntimeError("input_nonempty_before_type")
     lines = message.split("\n")
     for index, line in enumerate(lines):
         await _run_browser_stage("type_message", chat_input.type(line, delay=50))
         if index < len(lines) - 1:
             await _run_browser_stage("type_newline", chat_input.press("Shift+Enter"))
-    actual = await _run_browser_stage("input_after_type", read_exact())
-    if actual != _normalize_message_text(message):
+    if saas_editor_input:
+        actual = await _run_browser_stage("input_after_type", saas_editor.read_state(chat_input, message))
+        matches = actual == "expected"
+    else:
+        actual = await _run_browser_stage("input_after_type", read_exact())
+        matches = actual == _normalize_message_text(message)
+    if not matches:
         raise RuntimeError("input_mismatch_after_type")
     logger.info("Browser input checked emptyBefore=True exactAfter=True")
 
@@ -1118,9 +1151,44 @@ async def start_im_send_observer(page, account_name, target_name):
 
     return summary
 
+async def _saas_own_messages_today(page):
+    # Public component: MessageBoxContentisFromMe + msg-item-content; only
+    # the message's own text renderer and explicit Date metadata count.
+    now = datetime.now(_schedule_timezone())
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return await page.evaluate(r"""({start,end}) => {
+      const panels=[...document.querySelectorAll('#sub-app .componentsRightPanelwrapper')].filter(e=>e.getClientRects().length);
+      if(panels.length!==1)return [];
+      const result=[];
+      for(const node of panels[0].querySelectorAll('[data-e2e="msg-item-content"]')){
+        if(!node.getClientRects().length)continue;
+        const row=node.closest('.MessageBoxContentcolumnBox');
+        if(!row?.classList.contains('MessageBoxContentisFromMe'))continue;
+        const texts=[...node.querySelectorAll('.MessageItemTextbubbleTextContent')].filter(e=>e.getClientRects().length);
+        if(texts.length!==1)continue;
+        const key=Object.keys(node).find(k=>k.startsWith('__reactFiber'));
+        let fiber=key&&node[key],message=null;
+        for(let i=0;fiber&&i<=6;i++,fiber=fiber.return){
+          if(fiber.memoizedProps?.message){message=fiber.memoizedProps.message;break;}
+        }
+        if(message?.isFromMe!==true || !(message.createdAt instanceof Date))continue;
+        const at=message.createdAt.getTime();if(!(at>=start&&at<end))continue;
+        const text=texts[0].innerText.trim();if(!text)continue;
+        const r=node.getBoundingClientRect();
+        const id=message.clientId;
+        const clientId=typeof id==='string' && id.length<=128 ? id : null;
+        result.push({text,clientId,createdMs:at,centerX:r.left+r.width/2,centerY:r.top+r.height/2,top:r.top,bottom:r.bottom,right:r.right,className:row.className.slice(0,240)});
+      }
+      return result;
+    }""", {"start":start.timestamp()*1000,"end":(start+timedelta(days=1)).timestamp()*1000})
+
+
 @_bounded_browser_stage("last_message_read")
 async def snapshot_last_own_message(page, chat_input=None):
     try:
+        if await im_ui.is_saas_ui(page):
+            messages = await _saas_own_messages_today(page)
+            return messages[-1] if messages else None
         return await page.evaluate(
             r"""() => {
                 // ---- DOM structure (douyin creator private message) ----
@@ -1183,6 +1251,10 @@ async def snapshot_last_own_message(page, chat_input=None):
 async def count_today_own_message_matches(page, target_text):
     """Count how many of *target_text* appear in today's own-message bubbles."""
     try:
+        if await im_ui.is_saas_ui(page):
+            messages = await _saas_own_messages_today(page)
+            expected = _normalize_message_text(target_text)
+            return sum(_normalize_message_text(item['text']) == expected for item in messages)
         return await page.evaluate(
             r"""(targetText) => {
                 const allRows = Array.from(
@@ -1265,8 +1337,48 @@ async def count_visible_message_matches(page, message, chat_input=None):
     return visible_count
 
 
+_MESSAGE_CONFIRM_BUDGET_SECONDS = 8
+_MESSAGE_CONFIRM_POLL_SECONDS = 1
+
+
+async def _confirm_saas_message(page, chat_input, message, before_snapshot, before_indicator, since_ms):
+    """Require independent evidence for the editor and the new own bubble."""
+    expected = _normalize_message_text(message)
+    previous_id = (before_snapshot or {}).get('clientId')
+    previous_at = (before_snapshot or {}).get('createdMs')
+    if before_indicator is None:
+        before_indicator = await _detect_send_failure_indicator(page)
+    deadline = asyncio.get_running_loop().time() + _MESSAGE_CONFIRM_BUDGET_SECONDS
+    while True:
+        await asyncio.sleep(_MESSAGE_CONFIRM_POLL_SECONDS)
+        editor_state = await _run_browser_stage('read_chat_input', saas_editor.read_state(chat_input))
+        failure = await _detect_send_failure_indicator(page)
+        if failure and failure != before_indicator:
+            return False, 'send failure indicator detected: SaaS page'
+        snapshot = await snapshot_last_own_message(page, chat_input=chat_input)
+        bubble_seen = False
+        if snapshot and expected and _normalize_message_text(snapshot.get('text')) == expected:
+            observed_at = snapshot.get('createdMs')
+            observed_id = snapshot.get('clientId')
+            bubble_seen = bool(
+                observed_id and observed_id != previous_id
+                and isinstance(observed_at, (int, float)) and observed_at >= since_ms
+                and (previous_at is None or observed_at >= previous_at)
+                and (not before_snapshot or previous_id)
+            )
+        if editor_state == 'empty' and bubble_seen:
+            return True, 'last own message matches sent text; chat input cleared'
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.info('SaaS send UI evidence editor=%s newOwnBubble=%s', editor_state, bubble_seen)
+            if editor_state != 'empty':
+                return False, 'SaaS chat input not confirmed clear'
+            return False, 'chat input cleared but no new own message bubble was confirmed'
+
+
 @_bounded_browser_stage("confirm_message", cancel_grace_seconds=.5)
-async def confirm_message_sent(page, chat_input, message, before_snapshot=None, before_indicator=None):
+async def confirm_message_sent(page, chat_input, message, before_snapshot=None, before_indicator=None, *, saas_since_ms=None):
+    if saas_since_ms is not None:
+        return await _confirm_saas_message(page, chat_input, message, before_snapshot, before_indicator, saas_since_ms)
     expected_message = _normalize_message_text(message)
     before_signature = None
     if before_snapshot:
@@ -1406,6 +1518,8 @@ async def detect_message_already_sent(page, chat_input, message, before_snapshot
 
 
 def classify_browser_failure(stage, exc):
+    if getattr(exc, 'category', None) == 'browser_resource_unavailable':
+        return 'browser_resource_unavailable'
     if isinstance(exc, BrowserDialogBlocked):
         return exc.category
     if isinstance(exc, BrowserStageTimeout):
@@ -1421,6 +1535,8 @@ def classify_browser_failure(stage, exc):
         return "group_not_found"
     if "group_identity_unavailable" in lowered:
         return "group_identity_unavailable"
+    if "friend_list_empty" in lowered:
+        return "friend_list_empty"
     if "friend_list_unavailable" in lowered:
         return "friend_list_unavailable"
     if "friend_list_incomplete" in lowered:
@@ -1456,6 +1572,14 @@ class FriendListUnavailableError(RuntimeError):
     pass
 
 
+class FriendListEmptyError(RuntimeError):
+    """The page proved the filtered list is empty (end/empty marker persisted).
+
+    A genuinely empty list is a complete read, not a page failure: callers end
+    the scan instead of retrying or pausing the whole account.
+    """
+
+
 class FriendListIncompleteError(RuntimeError):
     pass
 
@@ -1469,6 +1593,8 @@ class GroupTargetSelectionError(FriendListUnavailableError):
 
 
 ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
+    "group_identity_unavailable",
+    "browser_resource_unavailable",
     "browser_dialog_blocked",
     "browser_stage_timeout",
     "browser_cleanup_blocked",
@@ -1486,6 +1612,7 @@ ACCOUNT_LEVEL_FAILURE_CATEGORIES = {
 
 
 TEMPORARY_ACCOUNT_FAILURE_CATEGORIES = {
+    "browser_resource_unavailable",
     "browser_stage_timeout",
     "friend_list_unavailable",
     "friend_list_timeout",
@@ -1573,7 +1700,7 @@ async def _first_non_empty_locator(page, selectors):
 
 async def _selector_visible(page, selectors):
     for selector in selectors:
-        locator = page.locator(selector).first
+        locator = page.locator(selector).filter(visible=True)
         try:
             count = await _locator_count_with_timeout(
                 locator,
@@ -1581,7 +1708,7 @@ async def _selector_visible(page, selectors):
                 "selector_visible",
                 selector,
             )
-            if count and await locator.is_visible(timeout=500):
+            if count and await locator.first.is_visible(timeout=500):
                 return selector
         except Exception:
             continue
@@ -1619,8 +1746,38 @@ async def _click_first_visible_locator(candidates, account_name, stage):
     return False
 
 
+async def _sender_chat_variant_is_saas(page):
+    legacy_confirmed = False
+    async def legacy_probe():
+        nonlocal legacy_confirmed
+        selector = await _selector_visible(page, (
+            '#sub-app li.semi-list-item',
+            '#sub-app [class*="item-header-name-"]',
+            '#sub-app [role="tab"]',
+        ))
+        legacy_confirmed = bool(selector)
+        return legacy_confirmed
+    saas = await im_ui.wait_for_saas_ui(
+        page, timeout_ms=SENDER_SAAS_DETECT_TIMEOUT_MS, legacy_probe=legacy_probe)
+    if not saas and not legacy_confirmed:
+        raise FriendListUnavailableError('friend_list_unavailable: 未识别到已就绪的新旧私信页面')
+    return saas
+
+
+async def _require_saas_filter(page, kind):
+    try:
+        activated = await im_ui.activate_saas_filter(page, kind)
+    except im_ui.SaasFilterError as exc:
+        raise FriendListUnavailableError(f"friend_list_unavailable: SaaS {kind} filter: {exc}") from exc
+    if not activated:
+        raise FriendListUnavailableError(f"friend_list_unavailable: SaaS {kind} filter page changed")
+
+
 async def _open_friends_tab(page, account_name, fallback_selector, target_selectors):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_friends_tab")
+    if await _sender_chat_variant_is_saas(page):
+        await _require_saas_filter(page, "friend")
+        return "saas_verified"
     # Group and friend rows use the same DOM shape.  A visible row therefore
     # proves neither that the friends tab is active nor that it is safe to
     # select from it; always explicitly open the friends tab first.
@@ -1709,6 +1866,9 @@ def _dedupe_group_target_aliases(targets):
 
 async def _open_groups_tab(page, account_name):
     await _dismiss_non_login_dialogs(page, account_name, "before_open_groups_tab")
+    if await _sender_chat_variant_is_saas(page):
+        await _require_saas_filter(page, "group")
+        return
     sub_app = page.locator('xpath=//*[@id="sub-app"]')
     candidates = [
         ("page role tab 群消息", page.get_by_role("tab", name="群消息", exact=True)),
@@ -1726,7 +1886,9 @@ async def _open_groups_tab(page, account_name):
 
 
 async def _group_tab_is_active(page, account_name):
-    """Trust group rows only while the visible 群消息 role tab is selected."""
+    """Trust group rows only while the exact group filter is selected."""
+    if await im_ui.is_saas_ui(page):
+        return await im_ui.saas_filter_is_active(page, "group")
     locator = page.get_by_role("tab", name="群消息", exact=True)
     count = await _locator_count_with_timeout(
         locator, account_name, "verify_groups_tab", "role=tab[name=群消息]"
@@ -1748,13 +1910,17 @@ _GROUP_HEADER_SELECTOR = '#sub-app div[class*="box-header-"]'
 
 async def _read_group_row_conversation_id(row_locator):
     """Read the numeric conversation identity exposed by a group row's React fiber."""
+    if await row_locator.get_attribute('data-e2e') == 'conversation-item':
+        return await saas_group_guard.read_row_id(row_locator)
     script = """(element) => {
         const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
         let fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
         let fiber = fiberKey && element[fiberKey];
         for (let level = 0; fiber && level <= 3; level += 1, fiber = fiber.return) {
-            const conversation = fiber.memoizedProps?.header?.props?.conversation;
-            const value = conversation?.id ?? conversation?.shortId;
+            const saas = element.matches('[data-e2e="conversation-item"]');
+            const conversation = saas ? fiber.memoizedProps?.conversation : fiber.memoizedProps?.header?.props?.conversation;
+            if (saas && conversation && conversation.type !== 2) return null;
+            const value = saas ? (conversation?.shortId ?? conversation?.id) : (conversation?.id ?? conversation?.shortId);
             if (valid(value)) return value;
         }
         return null;
@@ -1824,7 +1990,9 @@ async def _stable_single_screen_group_list(page, scrollable):
 
 
 async def _confirm_group_chat_header(page, expected_name):
-    """Require the selected chat header to name the exact configured group."""
+    """Require the legacy chat header to name the exact group."""
+    if await im_ui.is_saas_ui(page):
+        return False  # SaaS selection requires the committed, ID-bound proof.
     try:
         await page.wait_for_function(
             """({ selector, expectedName }) => Array.from(document.querySelectorAll(selector))
@@ -1847,6 +2015,8 @@ async def _verify_open_group_conversation(page, chat_input, bound_id):
     Context membership is corroborating evidence only: its list order does not
     identify the active conversation, but a present context must include the id.
     """
+    if await im_ui.is_saas_ui(page):
+        return await saas_group_guard.verify_open(page, chat_input, bound_id)
     try:
         anchor = await chat_input.element_handle() if chat_input is not None else None
         if anchor is None:
@@ -1886,6 +2056,10 @@ async def _read_group_header_conversation_id(page, bound_id=None):
     ``allList`` is never indexed: when a bound id is supplied, it only proves
     that exact id is represented in the header's React context.
     """
+    if await im_ui.is_saas_ui(page):
+        if bound_id and (await saas_group_guard.verify_open(page, None, bound_id))[0]:
+            return bound_id
+        return None
     script = """({ element, boundId }) => { const valid = value => typeof value === 'string' && /^\\d{10,25}$/.test(value);
         let key = Object.keys(element || {}).find(key => key.startsWith('__reactFiber'));
         let fiber = key && element[key];
@@ -1923,14 +2097,22 @@ async def _scan_bound_group_rows(page, scrollable, selector, account_name, confi
             try:
                 if not await row.is_visible(timeout=800):
                     continue
-                conversation_id = await _read_group_row_conversation_id(row)
+                if await row.get_attribute("data-e2e") == "conversation-item":
+                    metadata = await saas_group_guard.read_row_metadata(row)
+                    if metadata and metadata["type"] in {1, 3, 4, 17}:
+                        continue
+                    conversation_id = metadata.get("conversationId") if metadata and metadata["type"] == 2 else None
+                    display_name = metadata.get("name", "") if metadata else ""
+                else:
+                    conversation_id = await _read_group_row_conversation_id(row)
+                    display_name = await _extract_friend_display_name(row)
                 if not conversation_id:
                     raise FriendListIncompleteError(
                         f"group_identity_unavailable for {account_name}: visible group row has no conversation id"
                     )
                 if conversation_id not in seen_ids:
                     seen_ids.add(conversation_id)
-                    found.append((conversation_id, await _extract_friend_display_name(row)))
+                    found.append((conversation_id, display_name))
                     added += 1
             except FriendListIncompleteError:
                 raise
@@ -1953,6 +2135,8 @@ async def _click_bound_group_row_atomically(row_locator, bound_id):
 
     Returns "clicked", or a short reason why nothing was clicked.
     """
+    if await row_locator.get_attribute('data-e2e') == 'conversation-item':
+        return await saas_group_guard.select_row(row_locator, bound_id)
     script = """(element, boundId) => {
         const valid = (value) => typeof value === 'string' && /^\\d{10,25}$/.test(value);
         const fiberKey = Object.keys(element || {}).find((key) => key.startsWith('__reactFiber'));
@@ -1992,7 +2176,7 @@ async def _locate_bound_group_row(page, scrollable, selector, bound_id, account_
         raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: could not reset group list")
     deadline = asyncio.get_running_loop().time() + float(config["maxScanSeconds"])
     while asyncio.get_running_loop().time() <= deadline:
-        for row in await page.locator('#sub-app li.semi-list-item').all():
+        for row in await page.locator(selector).all():
             if await row.is_visible(timeout=800) and await _read_group_row_conversation_id(row) == bound_id:
                 return row
         state = await page.evaluate("""async (element) => { element.scrollTop += Math.max(1, element.clientHeight);
@@ -2022,12 +2206,16 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
     scrollable_selectors = ('#sub-app [role="grid"]', '#sub-app .ReactVirtualized__Grid', 'xpath=//*[@id="sub-app"]//ul/div')
     config = friend_scan_config or _normalize_friend_list_scan_config({})
     await _open_groups_tab(page, account_name)
+    saas = await im_ui.is_saas_ui(page)
+    if saas:
+        target_selectors = (im_ui.SAAS_ROW_SELECTOR,)
+        scrollable_selectors = im_ui.SAAS_SCROLL_SELECTORS
     try:
         active_selector, _ = await _wait_for_friend_list_ready(
-            page, account_name, target_selectors, (), (),
+            page, account_name, target_selectors, ('.LeftPanelEmptywrapper',), (),
             timeout_seconds=min(60, config["maxScanSeconds"]), empty_grace_seconds=0,
         )
-    except FriendListUnavailableError:
+    except (FriendListUnavailableError, FriendListEmptyError):
         # A group without a spark is still a valid empty/nonmatching result.
         return
     _, initial_scrollable = await _first_scrollable_friends_element(page, scrollable_selectors)
@@ -2083,18 +2271,24 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
                     errors.append({"target": configured, "category": "group_identity_unavailable", "reason": reason})
                     continue
                 raise FriendListIncompleteError(reason)
-            if not await _confirm_group_chat_header(page, current_name):
-                if errors is not None:
-                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: chat header did not confirm target {configured}"})
-                    continue
-                raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: chat header did not confirm target {configured}")
-            header_id = await _read_group_header_conversation_id(page, bound_id)
-            if header_id is not None and header_id != bound_id:
-                if errors is not None:
-                    errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: opened chat id changed"})
-                    continue
-                raise FriendListIncompleteError(f"group_identity_unavailable for {account_name}: opened chat id changed")
-            verified, verify_reason = await _verify_open_group_conversation(page, None, bound_id)
+            if saas:
+                # Use the same title/identity rule as the final Enter guard.
+                # Do not fall back to the legacy proof if the shell disappears.
+                verified, verify_reason = await saas_group_guard.verify_open(
+                    page, None, bound_id, expected_name=current_name)
+            else:
+                if not await _confirm_group_chat_header(page, current_name):
+                    if errors is not None:
+                        errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: chat header did not confirm target {configured}"})
+                        continue
+                    raise FriendListIncompleteError(f"group_list_incomplete for {account_name}: chat header did not confirm target {configured}")
+                header_id = await _read_group_header_conversation_id(page, bound_id)
+                if header_id is not None and header_id != bound_id:
+                    if errors is not None:
+                        errors.append({"target": configured, "category": "group_identity_unavailable", "reason": f"group_identity_unavailable for {account_name}: opened chat id changed"})
+                        continue
+                    raise FriendListIncompleteError(f"group_identity_unavailable for {account_name}: opened chat id changed")
+                verified, verify_reason = await _verify_open_group_conversation(page, None, bound_id)
             if not verified:
                 reason = f"group_identity_unavailable for {account_name}: {verify_reason}"
                 if errors is not None:
@@ -2111,6 +2305,8 @@ async def scroll_and_select_group_targets(page, account_name, targets, friend_sc
             await page.evaluate("(element) => { element.scrollTop = 0; return element.scrollTop === 0; }", initial_scrollable)
         except Exception:
             pass
+    if saas:
+        raise FriendListIncompleteError('group_identity_unavailable: 新版群聊必须具有已保存的会话绑定')
     snapshot = await _stable_single_screen_group_list(page, initial_scrollable)
     if snapshot is None:
         raise FriendListIncompleteError(
@@ -2204,6 +2400,7 @@ async def _wait_for_friend_list_ready(
     started_at = asyncio.get_running_loop().time()
     last_loading_seen_at = None
     last_dialog_dismissed_at = None
+    empty_marker_since = None
     while True:
         dismissed_count = await _dismiss_non_login_dialogs(page, account_name, "friend_list_ready")
         if dismissed_count:
@@ -2220,18 +2417,26 @@ async def _wait_for_friend_list_ready(
 
         no_more_selector = await _selector_visible(page, no_more_selectors)
         if no_more_selector:
-            elapsed = asyncio.get_running_loop().time() - started_at
-            if elapsed > empty_grace_seconds:
-                raise FriendListUnavailableError(
-                    f"friend_list_unavailable for {account_name}: no friend entries visible; "
-                    f"empty/end selector {no_more_selector} is visible after {empty_grace_seconds}s"
+            if empty_marker_since is None:
+                empty_marker_since = asyncio.get_running_loop().time()
+            # The end/empty marker must stay visible for the whole grace window
+            # before the list is accepted as empty; a marker that flickers and
+            # is then replaced by rows is hydration, not an empty list.
+            if asyncio.get_running_loop().time() - empty_marker_since > empty_grace_seconds:
+                raise FriendListEmptyError(
+                    f"friend_list_empty for {account_name}: no friend entries visible; "
+                    f"empty/end selector {no_more_selector} stayed visible for "
+                    f"{empty_grace_seconds}s"
                 )
+            elapsed = asyncio.get_running_loop().time() - started_at
             logger.debug(
                 "Account %s saw empty/end selector %s after %.1fs; waiting within grace window",
                 account_name,
                 no_more_selector,
                 elapsed,
             )
+        else:
+            empty_marker_since = None
 
         loading_selector = await _selector_visible(page, loading_selectors)
         if loading_selector:
@@ -2255,6 +2460,7 @@ async def _wait_for_friend_list_ready(
 
 async def _extract_friend_display_name(element):
     name_selectors = (
+        '.conversationConversationItemtitle',
         """xpath=.//span[contains(@class, "item-header-name-")]""",
         """xpath=.//*[contains(@class, "item-header-name-")]""",
     )
@@ -2310,7 +2516,15 @@ async def _extract_friend_stable_keys(element):
 
 
 async def _extract_friend_record(element):
-    display_name = await _extract_friend_display_name(element)
+    if await element.get_attribute('data-e2e') == 'conversation-item':
+        # The SaaS 全部 filter includes groups. Never mix their names into the
+        # friend index; unknown row types are unreadable, not guessed friends.
+        snapshot = await saas_group_guard.read_row_metadata(element)
+        if not snapshot or snapshot.get("type") != 1:
+            return None
+        display_name = snapshot["name"]
+    else:
+        display_name = await _extract_friend_display_name(element)
     normalized_name = _normalize_target_name(display_name)
     if not normalized_name:
         return None
@@ -2415,6 +2629,7 @@ async def scroll_and_select_user(
         return
     friends_tab_selector = 'xpath=//*[@id="sub-app"]/div/div/div[1]/div[2]'
     target_selectors = (
+        im_ui.SAAS_ROW_SELECTOR,
         '#sub-app li[role="listitem"]:has([class*="item-header-name-"])',
         '#sub-app li.semi-list-item:has([class*="item-header-name-"])',
         'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]'
@@ -2422,7 +2637,7 @@ async def scroll_and_select_user(
         'xpath=//*[@id="sub-app"]//div[contains(@class, "semi-list-item-body") and .//span[contains(@class, "item-header-name-")]]',
         'xpath=//*[@id="sub-app"]//li[.//span[contains(@class, "item-header-name-")]]',
     )
-    scrollable_friends_selectors = (
+    scrollable_friends_selectors = im_ui.SAAS_SCROLL_SELECTORS + (
         '#sub-app [role="grid"]',
         '#sub-app .ReactVirtualized__Grid',
         'xpath=//*[@id="sub-app"]/div/div[1]/div[2]/div[2]/div/div/div[3]/div/div/div/ul/div',
@@ -2432,6 +2647,9 @@ async def scroll_and_select_user(
     no_more_selectors = (
         'xpath=//div[contains(@class, "no-more-tip-ftdJnu")]',
         'xpath=//*[@id="sub-app"]//*[contains(text(), "没有更多") or contains(text(), "暂无")]',
+        # SaaS empty panel (verified in the bundle: LeftPanelEmptywrapper),
+        # rendered when the filtered conversation list is genuinely empty.
+        '.LeftPanelEmptywrapper',
     )
     loading_selectors = (
         'xpath=//div[contains(@class, "semi-spin")]',
@@ -2442,11 +2660,12 @@ async def scroll_and_select_user(
     idle_scan_seconds = friend_scan_config["idleScanSeconds"]
     scroll_step_px = friend_scan_config["scrollStepPx"]
     scroll_delay_seconds = friend_scan_config["scrollDelaySeconds"]
-    ready_timeout_seconds = 60
-    empty_grace_seconds = 30
+    ready_timeout_seconds = 90
+    empty_grace_seconds = 45
 
     ready_errors = []
     active_target_selector = ""
+    friend_list_empty = False
     for ready_attempt in range(2):
         logger.debug("Account %s is opening the friends tab attempt=%s", account_name, ready_attempt + 1)
         await _open_friends_tab(page, account_name, friends_tab_selector, target_selectors)
@@ -2461,6 +2680,12 @@ async def scroll_and_select_user(
                 timeout_seconds=ready_timeout_seconds,
                 empty_grace_seconds=empty_grace_seconds,
             )
+            break
+        except FriendListEmptyError as exc:
+            # The page persisted an end/empty marker: the list is a complete
+            # read with no rows, so reloading the chat page cannot change it.
+            logger.info("Account %s friend list proved empty: %s", account_name, exc)
+            friend_list_empty = True
             break
         except FriendListUnavailableError as exc:
             ready_errors.append(str(exc))
@@ -2614,6 +2839,20 @@ async def scroll_and_select_user(
         await asyncio.sleep(min(scroll_delay_seconds, 1))
         return True
 
+    if friend_list_empty:
+        # The empty marker persisted through its grace window: the list is a
+        # complete read with no rows. Every remaining target is missing, but
+        # this is not a page failure and must not pause the account.
+        missing_delivery_targets.update(remaining_targets)
+        remaining_targets.clear()
+        await persist_index(True, reached_end=True)
+        logger.info(
+            "Account %s friend list is empty; skipping %s remaining delivery targets",
+            account_name,
+            len(missing_delivery_targets),
+        )
+        return
+
     await reset_friend_list_scroll()
 
     if uid_collector is not None:
@@ -2642,15 +2881,22 @@ async def scroll_and_select_user(
         await _dismiss_non_login_dialogs(page, account_name, "friend_list_scan")
         selector, target_locator = await _first_non_empty_locator(page, (active_target_selector,) + tuple(target_selectors))
         if not target_locator:
-            active_target_selector, _ = await _wait_for_friend_list_ready(
-                page,
-                account_name,
-                target_selectors,
-                no_more_selectors,
-                loading_selectors,
-                timeout_seconds=30,
-                empty_grace_seconds=15,
-            )
+            try:
+                active_target_selector, _ = await _wait_for_friend_list_ready(
+                    page,
+                    account_name,
+                    target_selectors,
+                    no_more_selectors,
+                    loading_selectors,
+                    timeout_seconds=30,
+                    empty_grace_seconds=15,
+                )
+            except FriendListEmptyError:
+                # Rows vanished and the empty marker persisted: the filtered
+                # list is now a complete empty read, so stop scanning.
+                logger.info("Account %s friend list became empty mid-scan", account_name)
+                friend_list_empty = True
+                break
             continue
         target_elements = await _run_friend_scan_stage(
             "friend_list_read_rows",
@@ -2749,6 +2995,9 @@ async def scroll_and_select_user(
             if remaining_targets:
                 await reset_friend_list_scroll()
             continue
+
+        if friend_list_empty:
+            break
 
         if not remaining_targets and not remaining_index_targets:
             logger.info("Account %s found all delivery and indexed target friends", account_name)
@@ -2875,16 +3124,27 @@ def _normalize_send_window(config):
     else:
         try:
             end_minutes = int(raw.get("endHour", 18)) * 60
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             end_minutes = -1
+    try:
+        start_hour = int(raw.get("startHour", 10))
+    except (TypeError, ValueError, OverflowError):
+        start_hour = -1
+    try:
+        interval = max(1, int(raw.get("scheduleIntervalMinutes", 10)))
+        interval_valid = True
+    except (TypeError, ValueError, OverflowError):
+        interval, interval_valid = 1, False
     normalized = {
         "enabled": bool(raw.get("enabled", False)),
-        "startHour": int(raw.get("startHour", 10)),
+        "startHour": start_hour,
         "endHour": end_minutes // 60 if end_minutes >= 0 else -1,
         "endMinute": end_minutes % 60 if end_minutes >= 0 else -1,
         "endTime": raw_end_time or f"{end_minutes // 60:02d}:{end_minutes % 60:02d}",
-        "scheduleIntervalMinutes": max(1, int(raw.get("scheduleIntervalMinutes", 10))),
+        "scheduleIntervalMinutes": interval,
     }
+    if not interval_valid:
+        normalized["enabled"] = False
     exact_time = str(raw.get("exactTime") or "")
     if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", exact_time):
         normalized["exactTime"] = exact_time
@@ -4258,10 +4518,10 @@ def _browser_login_generation_current(user):
         return False
 
 
-async def _dispatch_browser_enter_if_current(user, chat_input):
+async def _dispatch_browser_enter_if_current(user, chat_input, target_name=None):
     # Read inside the dispatch task, not before it is queued by the stage wrapper.
     from core import automatic_recovery
-    if (not automatic_recovery.dispatch_allowed(user)
+    if (not automatic_recovery.dispatch_allowed(user, target=target_name)
             or send_pause.should_pause_sending() or not personal_streak.authorized(user)
             or not personal_streak.within_send_window(user)
             or not _browser_login_generation_current(user)):
@@ -4863,6 +5123,14 @@ async def do_user_task(
                     # Never replace in-flight/unknown or confirmed target outcomes.
                     _record_browser_stage_failure(user, exc, user.get("targets") or [])
                     break
+                except Exception as exc:
+                    if classify_browser_failure("browser_launch", exc) != "browser_resource_unavailable":
+                        raise
+                    _persist_account_send_failure(
+                        user, "browser_resource_unavailable", str(exc),
+                        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        _browser_not_started_targets(user, user.get("targets") or []))
+                    break
         finally:
             _BROWSER_OPERATION_OWNER.reset(owner_token)
             if account_lock_handle is not None:
@@ -5071,9 +5339,12 @@ async def _do_user_task_locked(
                 chat_input = None
                 last_own_message_before = None
                 send_receipt = {}
+                group_guard_required = False
+                saas_editor_input = False
                 try:
                     await _run_browser_stage("debug_selected", save_debug_artifacts(page, account_name, target_name, "selected-friend"))
                     chat_input, selector_used = await _run_browser_stage("locate_chat_input", locate_chat_input(page))
+                    saas_editor_input = selector_used == _SAAS_CHAT_INPUT_SELECTOR
                     logger.info("Using chat input selector %s for %s/%s", selector_used, account_name, target_name)
                     if parse_chat_target(target_name)[0] != "group":
                         await _require_friend_chat(page, user, target_name, wait=True)
@@ -5100,6 +5371,7 @@ async def _do_user_task_locked(
                         len((last_own_message_before or {}).get("text", "")),
                     )
 
+                    ensure_browser_resources("session")
                     started = _mark_browser_target_in_flight(
                         user,
                         target_name,
@@ -5114,7 +5386,7 @@ async def _do_user_task_locked(
                             target_name,
                         )
                         continue
-                    await _type_browser_message_checked(chat_input, message)
+                    await _type_browser_message_checked(chat_input, message, saas_editor_input=saas_editor_input)
 
                     await _run_browser_stage("debug_typed", save_debug_artifacts(page, account_name, target_name, "typed-message"))
 
@@ -5182,6 +5454,19 @@ async def _do_user_task_locked(
                             logger.error("Aborting before Enter: durable resend barrier unavailable")
                             return
                         await _require_friend_chat(page, user, target_name, arm=True)
+                    if parse_chat_target(target_name)[0] == "group" and (
+                            selector_used == _SAAS_CHAT_INPUT_SELECTOR or await im_ui.is_saas_ui(page)):
+                        # A proven SaaS editor must not lose its guard merely
+                        # because navigation removed the shell after locating it.
+                        # Arm before all remaining awaits. The capture listener
+                        # rechecks current identity synchronously at keydown.
+                        group_guard_required = True
+                        armed, reason = await _run_browser_stage(
+                            "group_arm", saas_group_guard.arm_enter(page, chat_input, bound_id))
+                        if not armed:
+                            raise friend_chat_guard.FriendIdentityError(
+                                "group_identity_unavailable: " + reason,
+                                category="group_identity_unavailable")
                     if action_gate is not None:
                         gate_result = await _run_browser_stage("action_report_gate", action_gate.ensure_before_enter())
                         logger.info(
@@ -5192,8 +5477,14 @@ async def _do_user_task_locked(
                             gate_result.get("waited_ms"),
                             gate_result.get("reports"),
                         )
+                    confirmation_context = {}
+                    if saas_editor_input:
+                        state = await _run_browser_stage('input_before_dispatch', saas_editor.read_state(chat_input, message))
+                        if state != 'expected':
+                            raise RuntimeError('input_mismatch_before_dispatch')
+                        confirmation_context['saas_since_ms'] = time.time_ns() // 1_000_000
                     logger.info("Pressing Enter to send message for %s/%s", account_name, target_name)
-                    if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input)):
+                    if not await _run_browser_stage("dispatch_enter", _dispatch_browser_enter_if_current(user, chat_input, target_name)):
                         cookie_export_safe = False
                         logger.info("Stopping old browser session: saved login changed at dispatch")
                         return
@@ -5203,12 +5494,20 @@ async def _do_user_task_locked(
                         if not allowed:
                             raise friend_chat_guard.FriendIdentityError('friend_identity_unavailable: Enter blocked at dispatch')
 
+                    if group_guard_required:
+                        allowed = await _run_browser_stage(
+                            "group_dispatch_guard", saas_group_guard.dispatch_was_allowed(page))
+                        if not allowed:
+                            raise friend_chat_guard.FriendIdentityError(
+                                "group_identity_unavailable: Enter blocked at dispatch",
+                                category="group_identity_unavailable")
                     sent_ok, detail = await _run_browser_stage("confirm_message", confirm_message_sent(
                         page,
                         chat_input,
                         message,
                         before_snapshot=last_own_message_before,
                         before_indicator=pre_send_indicator,
+                        **confirmation_context,
                     ))
                     im_summary = await _run_browser_stage("read_observer", im_observer_summary())
                     logger.info(
@@ -5265,7 +5564,7 @@ async def _do_user_task_locked(
                         "messageIntervalSecondsMax",
                     )
                     await _sleep_with_log(interval, "Delaying next browser message", account_name)
-                except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+                except (BrowserStageTimeout, BrowserResourceUnavailable, friend_chat_guard.FriendIdentityError):
                     # No recovery browser probes after a wedged stage or an
                     # identity mismatch, and never continue to another target.
                     try:
@@ -5280,7 +5579,10 @@ async def _do_user_task_locked(
                 except Exception as exc:
                     sent_ok = False
                     detail = ""
-                    if message:
+                    # The legacy recovery heuristic does not have a pre-Enter
+                    # time boundary or the SaaS model evidence. Keep its absence
+                    # from promoting an unrelated bubble or bypassing the receipt.
+                    if message and not saas_editor_input:
                         sent_ok, detail = await _run_browser_stage("recover_evidence", detect_message_already_sent(
                             page,
                             chat_input,
@@ -5364,7 +5666,12 @@ async def _do_user_task_locked(
                         "messageIntervalSecondsMax",
                     )
                     await _sleep_with_log(interval, "Delaying next browser message after failure", account_name)
-        except (BrowserStageTimeout, friend_chat_guard.FriendIdentityError):
+                finally:
+                    if group_guard_required:
+                        await _run_browser_stage(
+                            "group_disarm", saas_group_guard.disarm(page),
+                            timeout_seconds=BROWSER_CLEANUP_TIMEOUT_SECONDS)
+        except (BrowserStageTimeout, BrowserResourceUnavailable, friend_chat_guard.FriendIdentityError):
             raise
         except Exception as exc:
             for group_error in group_scan_errors:

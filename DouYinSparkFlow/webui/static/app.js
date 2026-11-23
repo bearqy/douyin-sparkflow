@@ -1,35 +1,53 @@
 (() => {
   const layout = document.querySelector("[data-settings-tabs]");
   if (!layout) return;
-  const links = [...layout.querySelectorAll(".settings-nav a")];
-  const panels = [...layout.querySelectorAll("section.settings-section")];
+  const nav = layout.querySelector(".settings-nav");
+  const content = layout.querySelector(".settings-panels");
+  const back = layout.querySelector("[data-settings-back]");
+  if (!nav || !content || !back) return;
+  const overviewMode = window.matchMedia("(max-width: 1100px)");
+  const links = [...nav.querySelectorAll("a")];
+  const panels = [...content.querySelectorAll("section.settings-section")];
   const select = () => {
     const requested = window.location.hash.slice(1)
       || new URLSearchParams(window.location.search).get("_anchor");
-    const selected = panels.find((panel) => panel.id === requested) || panels[0];
+    const panelId = requested === "password" ? "system" : requested;
+    const matched = panels.find((panel) => panel.id === panelId);
+    const selected = matched || (overviewMode.matches ? null : panels[0]);
+    nav.hidden = overviewMode.matches && Boolean(selected);
+    content.hidden = !selected;
+    back.hidden = !nav.hidden;
     panels.forEach((panel) => { panel.hidden = panel !== selected; });
     links.forEach((link) => {
-      const active = link.hash === `#${selected.id}`;
+      const active = link.hash === `#${selected?.id}`;
       link.classList.toggle("active", active);
       if (active) link.setAttribute("aria-current", "location");
       else link.removeAttribute("aria-current");
     });
+    return selected;
   };
-  links.forEach((link) => {
-    link.addEventListener("click", (event) => {
-      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-      if (!panels.some((panel) => `#${panel.id}` === link.hash)) return;
-      event.preventDefault();
-      const url = new URL(window.location.href);
-      url.searchParams.delete("_anchor");
-      url.hash = link.hash;
-      window.history.pushState(null, "", url);
-      select();
-      layout.scrollIntoView({ block: "start" });
-    });
-  });
+  const navigate = (event, hash) => {
+    if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    const previous = panels.find((panel) => !panel.hidden);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("_anchor");
+    url.hash = hash;
+    if (url.href !== window.location.href) window.history.pushState(null, "", url);
+    const selected = select();
+    const destination = selected?.querySelector("h2")
+      || links.find((link) => link.hash === `#${previous?.id}`) || links[0];
+    if (destination) {
+      if (selected) destination.tabIndex = -1;
+      destination.focus({ preventScroll: true });
+    }
+    window.scrollTo(0, 0);
+  };
+  links.forEach((link) => link.addEventListener("click", (event) => navigate(event, link.hash)));
+  back.addEventListener("click", (event) => navigate(event, ""));
   window.addEventListener("hashchange", select);
   window.addEventListener("popstate", select);
+  overviewMode.addEventListener("change", select);
   select();
 })();
 
@@ -44,7 +62,7 @@
       for (let parent = target.parentElement; parent; parent = parent.parentElement) {
         if (parent.matches("details")) parent.open = true;
       }
-      target.scrollIntoView({ block: "start" });
+      (target.closest("[data-settings-tabs]") || target).scrollIntoView({ block: "start" });
     }
   };
   if (document.readyState === "loading") {
@@ -334,6 +352,10 @@
     const unconfirmed = Number(summary.unconfirmed) || 0;
     const failed = Number(summary.failed) || 0;
     const waitingForReply = Number(summary.waitingForReply) || 0;
+    setText("[data-overview-value='waitingForReply']", waitingForReply);
+    document.querySelectorAll("[data-reply-wait-summary]").forEach((node) => {
+      node.hidden = waitingForReply === 0;
+    });
     const blocked = Number(summary.blocked) || 0;
     const attention = Number(summary.attention) || 0;
     const pending = (Number(summary.pending) || 0) + (Number(summary.unprocessed) || 0);
@@ -1501,10 +1523,10 @@
         if (status) {
           const payload = error.payload || {};
           const label = payload.categoryLabel ? `（${payload.categoryLabel}）` : "";
-          const retryHint =
-            payload.retryable === false
-              ? "这类失败重试通常无效，请重新获取 Cookie。"
-              : "可稍后重试。";
+          const inputError = ["cookie_format_invalid", "cookie_auth_missing", "cookie_auth_expired"].includes(payload.category);
+          const retryHint = inputError ? "" : payload.retryable === false
+            ? "请在已登录的抖音页面重新导出。"
+            : "可稍后重试。";
           status.textContent = payload.identityState
             ? `Cookie 登录未保存：${identityFailureText(error)}`
             : `Cookie 登录失败${label}：${error.message}${retryHint}`;

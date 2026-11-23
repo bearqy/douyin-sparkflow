@@ -221,9 +221,11 @@ class ObservedFriendChatTests(unittest.IsolatedAsyncioTestCase):
             const row=document.createElement('li');row.className='semi-list-item';row.innerHTML='<span class="item-header-name-demo">demo-A</span>';
             row['__reactFiber$demo']={tag:5,stateNode:row,memoizedProps:{header:{props:{conversation:{shortId:second?'7691234567890123402':'7691234567890123401',secUid:second?'demo-sec-B':'demo-sec-A'}}}}};
             row.querySelector('span').onclick=()=>window.clicked++;ul.insertBefore(row,ul.firstChild);
+            window.secondIdentityRendered=second;
           }ul.addEventListener('scroll',render);render();</script>''')
         locator=self.page.locator('li').first
-        await self.page.evaluate("document.querySelector('ul').scrollTop=120;document.querySelector('ul').dispatchEvent(new Event('scroll'))")
+        await self.page.evaluate("document.querySelector('ul').scrollTop=120")
+        await self.page.wait_for_function("window.secondIdentityRendered === true")
         selected, reason = await guard.select_friend(self.page,locator,ACCOUNT,'demo-A')
         self.assertFalse(selected)
         self.assertEqual(reason,'friend_row_identity_mismatch')

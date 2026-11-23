@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from pathlib import Path
 import tempfile
 
-from core import friends
+from core import friends, streak_state
 from tests import test_shared_security as fixtures
 from utils import config
 from webui import app as app_module, login_lock, users
@@ -48,6 +48,47 @@ class AccountRecordRefRoutingTests(unittest.TestCase):
 
     def stored(self):
         return {row["account_ref"]: row for row in config.get_userData(force_reload=True)}
+
+    def test_release_wait_is_record_scoped_and_never_runs_a_sender(self):
+        def seed(accounts):
+            for row in accounts:
+                streak_state.mark_waiting_for_reply(row, row["targets"][0])
+        config.update_user_data(seed)
+        rows = self.stored()
+        owned = rows["a3"]
+        target = "second target"
+        form = {
+            "csrf_token": self.token, "account_ref": "a3", "login_generation": "gen-a3",
+            "target": target, "target_ref": streak_state.resolve_target_ref(owned, target),
+            "waiting_token": streak_state.waiting_for_reply(owned, target)[1],
+        }
+        path = "/accounts/111/release-reply-wait"
+        foreign = rows["a1"]
+        denied_form = dict(
+            form, account_ref="a1", login_generation="gen-a1", target="first target",
+            target_ref=streak_state.resolve_target_ref(foreign, "first target"),
+            waiting_token=streak_state.waiting_for_reply(foreign, "first target")[1],
+        )
+        self.assertEqual(403, self.alice.post(path, data=denied_form).status_code)
+        self.assertEqual(403, self.alice.post(path, data=dict(form, csrf_token="")).status_code)
+        self.assertEqual(409, self.alice.post(path, data=dict(form, login_generation="old")).status_code)
+
+        page = self.alice.get("/ops/send-console")
+        self.assertIn('action="/accounts/111/release-reply-wait"', page.text)
+        with (
+            patch.object(app_module, "run_browser_tasks", new_callable=AsyncMock) as browser,
+            patch.object(app_module, "run_protocol_tasks", new_callable=AsyncMock) as protocol,
+            patch.object(app_module, "run_task_now") as background,
+        ):
+            response = self.alice.post(path, data=form, follow_redirects=False)
+            self.assertEqual(303, response.status_code)
+            self.assertEqual("/ops/send-console", response.headers["location"])
+            browser.assert_not_awaited()
+            protocol.assert_not_awaited()
+            background.assert_not_called()
+        rows = self.stored()
+        self.assertFalse(streak_state.waiting_for_reply_since(rows["a3"], target))
+        self.assertTrue(streak_state.waiting_for_reply_since(rows["a1"], "first target"))
 
     def form(self, **extra):
         return {

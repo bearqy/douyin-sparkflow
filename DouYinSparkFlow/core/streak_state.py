@@ -5,12 +5,14 @@ import os
 import re
 import tempfile
 import unicodedata
+import uuid
 from urllib.parse import parse_qs, urlparse
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from core.task_rejections import is_private_message_limit_receipt
 from utils.config import normalize_unique_id
 
 try:
@@ -26,6 +28,9 @@ STATE_SEND_CONFIRMED = "send_confirmed"
 STATE_STREAK_VERIFIED = "streak_verified"
 STATE_FAILED_RETRYABLE = "failed_retryable"
 STATE_FAILED_TERMINAL = "failed_terminal"
+WAITING_FOR_REPLY_SINCE = "waitingForReplySince"
+_WAITING_FOR_REPLY_TOKEN = "waitingForReplyToken"
+_WAITING_FOR_REPLY_RELEASE = "waitingForReplyRelease"
 
 TARGET_UID_BINDINGS_KEY = "target_uid_bindings"
 
@@ -518,6 +523,77 @@ def failure_entry(account, target_name, tz=None):
     return _legacy_failure_entry(account, target_name, target_ref, tz)
 
 
+def waiting_for_reply(account, target_name):
+    """Return the start and version of an active hold, including legacy receipts."""
+    target_ref = resolve_target_ref(account, target_name)
+    state = _state_bucket(account).get(target_ref)
+    if isinstance(state, dict) and state.get(WAITING_FOR_REPLY_SINCE):
+        since = str(state[WAITING_FOR_REPLY_SINCE])
+        return since, str(state.get(_WAITING_FOR_REPLY_TOKEN) or since)
+    failure = _legacy_failure_entry(account, target_name, target_ref)
+    if failure.get("category") == "send_rejected" and is_private_message_limit_receipt(failure.get("serverReceipt")):
+        since = str(failure.get("lastAttemptAt") or "")
+        return since, since
+    return "", ""
+
+
+def waiting_for_reply_since(account, target_name):
+    return waiting_for_reply(account, target_name)[0]
+
+
+def mark_waiting_for_reply(account, target_name, now=None):
+    now = _now(now)
+    state = _state_for_write(account, target_name, now)
+    if state.get(WAITING_FOR_REPLY_SINCE):
+        return False
+    state[WAITING_FOR_REPLY_SINCE] = _iso(now)
+    state[_WAITING_FOR_REPLY_TOKEN] = uuid.uuid4().hex
+    return True
+
+
+def release_waiting_for_reply(account, target_name, expected_token, now=None):
+    """Retire only this hold and keep its platform receipt as history."""
+    since, token = waiting_for_reply(account, target_name)
+    if not token or token != expected_token:
+        return False
+    now = _now(now)
+    state = _state_for_write(account, target_name, now)
+    state[_WAITING_FOR_REPLY_RELEASE] = {
+        "at": now.isoformat(),
+        "since": since,
+        "token": token,
+    }
+    state.pop(WAITING_FOR_REPLY_SINCE, None)
+    state.pop(_WAITING_FOR_REPLY_TOKEN, None)
+    _reset_retired_reply_failure(state, since, now)
+    return True
+
+
+def _reset_retired_reply_failure(state, since, now):
+    held_at = _parse_time(since)
+    if (
+        held_at and state.get("status") in FAILED_STATES
+        and _parse_time(state.get("lastAttemptAt")) == held_at
+        and (state.get("lastErrorCategory") == "send_rejected"
+             or str(state.get("lastErrorCategory") or "").startswith("protocol_"))
+    ):
+        state.update(status=STATE_PENDING, updatedAt=_iso(now), attemptCount=0)
+        for key in ("lastErrorCategory", "lastErrorReason", "lastAttemptAt"):
+            state.pop(key, None)
+
+
+def _failure_retired_by_reply_release(entry, release):
+    attempted = _parse_time(entry.get("lastAttemptAt"))
+    released = _parse_time(release.get("at"))
+    if not attempted or not released or attempted > released:
+        return False
+    if entry.get("category") == "send_rejected":
+        return is_private_message_limit_receipt(entry.get("serverReceipt"))
+    # Protocol failures saved before this feature keep the hold timestamp
+    # without a browser receipt. Retire only the attempt that created the hold.
+    return entry.get("lastRunMode") == "protocol" and attempted == _parse_time(release.get("since"))
+
+
 def clear_failure_entries(account, target_name):
     """Clear only this target's known nickname/stable-id aliases after success."""
     target_ref = resolve_target_ref(account, target_name)
@@ -641,6 +717,10 @@ def _legacy_failure_entry(account, target_name, target_ref, tz=None):
         for alias in aliases
         if alias in failures
     ]
+    state = _state_bucket(account).get(target_ref)
+    release = state.get(_WAITING_FOR_REPLY_RELEASE) if isinstance(state, dict) else None
+    if isinstance(release, dict):
+        entries = [entry for entry in entries if not _failure_retired_by_reply_release(entry, release)]
     return _latest_entry(entries, "lastAttemptAt", tz=tz)
 
 
@@ -915,6 +995,26 @@ def _upgrade_state_key(account, old_ref, new_ref, target_name=""):
                 base.get("fallbackAttempted")
                 or other.get("fallbackAttempted")
             )
+            releases = [
+                source[_WAITING_FOR_REPLY_RELEASE] for source in (base, other)
+                if isinstance(source.get(_WAITING_FOR_REPLY_RELEASE), dict)
+                and _parse_time(source[_WAITING_FOR_REPLY_RELEASE].get("at"))
+            ]
+            release = max(releases, key=lambda row: _parse_time(row["at"])) if releases else {}
+            if release:
+                merged[_WAITING_FOR_REPLY_RELEASE] = deepcopy(release)
+            released_since = _parse_time(release.get("since"))
+            merged.pop(WAITING_FOR_REPLY_SINCE, None)
+            merged.pop(_WAITING_FOR_REPLY_TOKEN, None)
+            for source in (base, other):
+                since = _parse_time(source.get(WAITING_FOR_REPLY_SINCE))
+                token = source.get(_WAITING_FOR_REPLY_TOKEN) or source.get(WAITING_FOR_REPLY_SINCE)
+                if since and token != release.get("token") and (not released_since or since >= released_since):
+                    merged[WAITING_FOR_REPLY_SINCE] = source[WAITING_FOR_REPLY_SINCE]
+                    merged[_WAITING_FOR_REPLY_TOKEN] = token
+                    break
+            if release and not merged.get(WAITING_FOR_REPLY_SINCE):
+                _reset_retired_reply_failure(merged, release["since"], _parse_time(release["at"]))
             fallback_candidates = []
             for state in (base, other):
                 fallback_at = _parse_time(state.get("fallbackAt"))
@@ -1282,6 +1382,8 @@ def claim_in_flight(
 ):
     now = _now(now)
     state = _state_for_write(account, target_name, now)
+    if waiting_for_reply_since(account, target_name):
+        return deepcopy(state), False
     event_time = _state_event_time(state)
     lease_expires_at = _parse_time(state.get("leaseExpiresAt"), now.tzinfo)
     fallback_at = _parse_time(state.get("fallbackAt"), now.tzinfo)
@@ -1570,6 +1672,7 @@ def fallback_eligible(account, target_name, now=None):
     fallback_at = _parse_time(state.get("fallbackAt"), now.tzinfo)
     return bool(
         state.get("status") == STATE_FAILED_RETRYABLE
+        and not waiting_for_reply_since(account, target_name)
         and not _is_schedule_today(fallback_at, now)
     )
 

@@ -78,6 +78,8 @@ def mark_target_unconfirmed(
     force=False,
     now=None,
 ):
+    if streak_state.waiting_for_reply_since(account, target_name):
+        return False
     now_dt = (now or datetime.now(_schedule_timezone())).replace(
         microsecond=0,
     )

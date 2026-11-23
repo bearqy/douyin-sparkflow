@@ -72,6 +72,17 @@ REFUSED_8101 = response(
         )
     )
 )
+PRIVATE_MESSAGE_LIMIT_TIP = "给对方发送的消息已达上限，对方回复或互关后才能继续发送消息"
+REFUSED_7467 = response(
+    body=send_body(
+        msg_id=None, status=3, check_code=2,
+        check_message=json.dumps({
+            "status_code": 7467, "tips": "",
+            "status_msg": {"msg_type": 1, "msg_content": {"tips": PRIVATE_MESSAGE_LIMIT_TIP, "template": []}},
+            "raw_check_code": 2,
+        }, ensure_ascii=False),
+    ),
+)
 
 
 class ParseSendResponseTests(unittest.TestCase):
@@ -219,6 +230,13 @@ class ObserverReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(receipt["protoOk"])
         self.assertEqual(8101, tasks._receipt_rejection(receipt)["value"])
         self.assertFalse(streak_state.receipt_is_strong(receipt))
+
+    async def test_private_message_limit_tip_is_saved_as_readable_text(self):
+        receipt = await self._observe(REFUSED_7467)
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(7467, receipt["rejection"]["value"])
+        self.assertEqual(PRIVATE_MESSAGE_LIMIT_TIP, receipt["platformTip"])
+        self.assertEqual(f"status_code=7467; {PRIVATE_MESSAGE_LIMIT_TIP}", receipt["reason"])
 
     async def test_accepted_body_with_http_error_is_not_ok(self):
         receipt = await self._observe(ACCEPTED, status=500)

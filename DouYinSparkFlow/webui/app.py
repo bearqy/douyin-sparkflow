@@ -1940,7 +1940,7 @@ def create_app():
         status_fields = {
             "confirmed": {"confirmed_targets"},
             "pending": {"unconfirmed_targets"},
-            "attention": {"failed_targets", "account_blocked_targets"},
+            "attention": {"failed_targets", "account_blocked_targets", "waiting_for_reply_targets"},
         }
         visible_fields = status_fields.get(status)
         filtered_accounts = []
@@ -1949,6 +1949,7 @@ def create_app():
             for field in (
                 "confirmed_targets", "page_echo_targets", "receipt_only_targets", "unconfirmed_targets",
                 "failed_targets", "account_blocked_targets", "pending_targets", "unprocessed_targets",
+                "waiting_for_reply_targets",
             ):
                 items = list(source.get(field) or [])
                 if visible_fields is not None and field not in visible_fields:
@@ -3578,6 +3579,46 @@ def create_app():
             flash(request, "Account not found.", "error")
         return redirect("/accounts")
 
+    @app.post("/accounts/{unique_id}/release-reply-wait")
+    async def release_reply_wait(request: Request, unique_id: str):
+        maybe_redirect = require_user(request)
+        if maybe_redirect:
+            return maybe_redirect
+        form = await request.form()
+        if not validate_csrf(request, str(form.get("csrf_token", ""))):
+            return PlainTextResponse("Invalid CSRF token", status_code=403)
+
+        target_name = streak_state.normalize_target_name(form.get("target", ""))
+        target_ref = str(form.get("target_ref") or "")
+        waiting_token = str(form.get("waiting_token") or "")
+        if not target_name or not target_ref or not waiting_token:
+            return PlainTextResponse("等待记录已变化，请刷新发送明细。", status_code=409)
+
+        def release(account, _accounts):
+            if not any(streak_state.normalize_target_name(target) == target_name for target in account.get("targets") or []):
+                return False
+            if streak_state.resolve_target_ref(account, target_name) != target_ref:
+                return False
+            return streak_state.release_waiting_for_reply(account, target_name, waiting_token)
+
+        _, released, access_error = mutate_account_for_request(
+            request, unique_id, release,
+            account_ref=str(form.get("account_ref") or "").strip() or None,
+            login_generation=str(form.get("login_generation", "")),
+            generation_present="login_generation" in form,
+        )
+        if access_error:
+            return PlainTextResponse(
+                "账号登录已变化，请刷新发送明细。" if access_error == 409
+                else ("Forbidden" if access_error == 403 else "Account not found"),
+                status_code=access_error,
+            )
+        if released:
+            flash(request, "已解除等待，好友将按正常发送计划处理。", "success")
+        else:
+            flash(request, "等待记录已变化，请核对当前状态。", "warning")
+        return redirect("/ops/send-console")
+
     @app.post("/accounts/{unique_id}/retry-target")
     async def retry_account_target(request: Request, unique_id: str):
         maybe_redirect = require_user(request)
@@ -3602,6 +3643,10 @@ def create_app():
         )
         if access_error:
             return access_error
+
+        if streak_state.waiting_for_reply_since(account, target_name):
+            flash(request, "该好友待对方回复或互关，重试任务未启动。", "warning")
+            return redirect("/ops/send-console")
 
         lock_status = task_run_lock_status()
         if lock_status.get("running"):

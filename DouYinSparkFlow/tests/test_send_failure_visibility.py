@@ -115,6 +115,19 @@ class YesterdayWeakSendDoesNotHideTodayFailureTests(unittest.TestCase):
             self.assertEqual("friend_not_found", entry["category"])
             self.assertEqual(_iso(TODAY), entry["lastAttemptAt"])
 
+    def test_browser_private_message_limit_hold_survives_failure_queue_cleanup(self):
+        stored = _account()
+        user = deepcopy(stored)
+        store = FakeStore([stored])
+        with patch.object(tasks, "update_user_data", store.update):
+            tasks._persist_browser_send_failure(
+                user, "抹茶叔叔", "", "send_rejected", "server refusal", _iso(TODAY),
+                server_receipt={"call": "message_send", "ok": False, "rejection": {"key": "status_code", "value": 7467}},
+            )
+        for account in (stored, user):
+            streak_state.clear_failure_entries(account, "抹茶叔叔")
+            self.assertEqual(_iso(TODAY), streak_state.waiting_for_reply_since(account, "抹茶叔叔"))
+
     def test_yesterday_needs_verification_clears_after_in_flight_failure_today(self):
         account = _account()
         original = streak_state.mark_sent_unverified(

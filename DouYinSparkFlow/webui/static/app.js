@@ -333,15 +333,17 @@
     const receiptOnly = Number(summary.receiptOnly) || 0;
     const unconfirmed = Number(summary.unconfirmed) || 0;
     const failed = Number(summary.failed) || 0;
+    const waitingForReply = Number(summary.waitingForReply) || 0;
     const blocked = Number(summary.blocked) || 0;
     const attention = Number(summary.attention) || 0;
     const pending = (Number(summary.pending) || 0) + (Number(summary.unprocessed) || 0);
     const total = Number(summary.total) || 0;
     const enabledAccounts = Number(summary.enabledAccounts) || 0;
-    const needsReview = attention > 0 || pageEcho > 0 || receiptOnly > 0;
+    const needsReview = attention > 0 || pageEcho > 0 || receiptOnly > 0 || waitingForReply > 0;
     const state = needsReview ? "attention" : "good";
     const iconName = needsReview ? "triangle-alert" : "circle-check";
-    const text = `今日结论：强确认 ${confirmed} · 弱证据（仅页面回显 ${pageEcho} · 仅回执未确认 ${receiptOnly}） · 待核验 ${unconfirmed} · 失败 ${failed} · 受账号阻断 ${blocked} · 待发送 ${pending}（共 ${total} 个目标，${enabledAccounts} 个启用账号）`;
+    const waitingText = waitingForReply ? ` · 待回复或互关 ${waitingForReply}` : "";
+    const text = `今日结论：强确认 ${confirmed} · 弱证据（仅页面回显 ${pageEcho} · 仅回执未确认 ${receiptOnly}） · 待核验 ${unconfirmed} · 失败 ${failed} · 受账号阻断 ${blocked}${waitingText} · 待发送 ${pending}（共 ${total} 个目标，${enabledAccounts} 个启用账号）`;
 
     document.querySelectorAll("[data-today-summary]").forEach((node) => {
       node.dataset.summaryState = state;
@@ -583,17 +585,21 @@
   const qrImage = document.querySelector("[data-login-qr]");
   const qrStatus = document.querySelector("[data-login-qr-status]");
   const qrOpenLink = document.querySelector("[data-open-login-qr]");
+  const verificationButton = document.querySelector("[data-open-manual-verification]");
+  const verificationPanel = document.querySelector("[data-login-interaction]");
   let timer = null;
   let heartbeatTimer = null;
   let pageActive = true, lifecycleVersion = 0, resumeChecking = false;
   let statusController = null, statusAgain = false, statusFailures = 0;
   let qrController = null, qrRequestPending = false, qrManualPending = false, qrVersion = 0;
   let lastHeartbeatAt = 0, browserLoginLabel = "", desktopState = {};
+  let verificationStep = "";
   const transientRequests = new Set();
   const canUseWorkspace = () => pageActive && !resumeChecking && !bindingBusy && !bindingNeedsReview && document.visibilityState === "visible";
   const publishWorkspace = () => {
     root.dataset.workspaceTicket = workspace.ticket || "";
     root.dataset.workspaceActive = workspace.state === "active" && workspace.active && canUseWorkspace() ? "1" : "0";
+    if (verificationButton) verificationButton.hidden = root.dataset.workspaceActive !== "1";
   };
   const cancelQr = () => {
     qrVersion += 1;
@@ -813,6 +819,7 @@
   const clearDesktopState = () => {
     desktopState = {};
     browserLoginLabel = "";
+    verificationStep = "";
   };
   const reusableAccountHint = () => reusableAccountSession() ? "沿用账号浏览器环境，可保存登录态。" : "";
 
@@ -824,19 +831,24 @@
     }
   };
 
-  const closeFrame = () => {
-    cancelQr();
-    if (nativePanel) nativePanel.hidden = true;
-    if (frameWrap) {
-      frameWrap.classList.remove("native-login-mode");
-      if (displayMode === "native") frameWrap.hidden = true;
-    }
+  const hideQrImage = () => {
     if (qrImage) {
       qrImage.hidden = true;
       const previous = qrImage.dataset.objectUrl || "";
       if (previous) URL.revokeObjectURL(previous);
       delete qrImage.dataset.objectUrl;
       qrImage.removeAttribute("src");
+    }
+  };
+
+  const closeFrame = () => {
+    cancelQr();
+    hideQrImage();
+    if (verificationPanel) verificationPanel.open = false;
+    if (nativePanel) nativePanel.hidden = true;
+    if (frameWrap) {
+      frameWrap.classList.remove("native-login-mode");
+      if (displayMode === "native") frameWrap.hidden = true;
     }
     if (!frame) return;
     frame.removeAttribute("src");
@@ -864,7 +876,7 @@
     if (desktop) updateDesktopState(desktop);
     const progress = root.querySelector("[data-login-progress]");
     if (progress) progress.textContent = workspace.state === "queued" ? "第 1 步：排队等待，轮到你后自动显示二维码。"
-      : workspace.state === "active" && workspace.active ? "第 2 步：扫码，按提示完成验证码或密码验证。"
+      : workspace.state === "active" && workspace.active ? (verificationStep ? "第 2 步：完成抖音短信验证。" : "第 2 步：扫码，按提示完成验证码或密码验证。")
       : "第 1 步：申请登录工作区。";
     document.querySelectorAll("[data-login-step]").forEach((item) => {
       if (Number(item.dataset.loginStep) === (workspace.state === "active" && workspace.active ? 2 : 1)) item.setAttribute("aria-current", "step");
@@ -1000,8 +1012,35 @@
     });
   };
 
+  verificationButton?.addEventListener("click", () => {
+    if (!verificationPanel || root.dataset.workspaceActive !== "1") return;
+    verificationPanel.open = true;
+    if (!verificationPanel.classList.contains("interaction-expanded")) {
+      verificationPanel.querySelector("[data-interaction-expand]")?.click();
+    }
+    verificationPanel.querySelector("summary")?.focus();
+  });
+
+  const showSmsVerification = (data) => {
+    const step = data.verification_step;
+    if (step !== "sms_method" && step !== "sms_code") return false;
+    if (!verificationStep) {
+      cancelQr();
+      hideQrImage();
+    }
+    verificationStep = step;
+    setQrButtons("刷新二维码");
+    if (qrPlaceholder) qrPlaceholder.textContent = "请在验证窗口继续登录";
+    if (qrStatus) qrStatus.textContent = step === "sms_method"
+      ? "抖音需要短信验证。点“打开验证窗口”，在抖音页面选择“接收验证码登录”。"
+      : "请在抖音验证窗口选择验证码输入框，输入短信验证码并确认。";
+    const progress = root.querySelector("[data-login-progress]");
+    if (progress) progress.textContent = "第 2 步：完成抖音短信验证。";
+    return true;
+  };
+
   const refreshLoginQr = async (delay = 0, retries = 40) => {
-    if (!qrImage || workspace.state !== "active" || !workspace.active || !canUseWorkspace() || bindingNeedsReview || (workspace.ticket && qrStoppedTicket === workspace.ticket)) return;
+    if (!qrImage || verificationStep || workspace.state !== "active" || !workspace.active || !canUseWorkspace() || bindingNeedsReview || (workspace.ticket && qrStoppedTicket === workspace.ticket)) return;
     window.clearTimeout(qrRefreshTimer);
     const heldTicket = workspace.ticket, heldVersion = qrVersion;
     const current = () => canUseWorkspace() && heldTicket === workspace.ticket && heldVersion === qrVersion;
@@ -1039,6 +1078,7 @@
         }
         if (response.status === 202) {
           const data = await response.json().catch(() => ({}));
+          if (!current() || showSmsVerification(data)) return;
           if (data.logged_in || data.state === "qr_logged_in" || data.state === "logged_in") {
             updateDesktopState(data);
             if (qrStatus) qrStatus.textContent = data.message || `${reusableAccountHint()} 当前浏览器已登录，请保存登录态。`;
@@ -1194,10 +1234,17 @@
       if (workspace.state === "active" && workspace.active) {
         if (Object.prototype.hasOwnProperty.call(data, "logged_in") && !data.logged_in) browserLoginLabel = "";
         loadFrame();
+        if (showSmsVerification(data)) return;
         if (qrImage?.hidden && !qrRequestPending && !bindingNeedsReview && !desktopState.logged_in) refreshLoginQr(100);
         if (statusHeld()) {
           // An in-progress save or its error owns the status line.
         } else if (data.logged_in) {
+          if (verificationStep) {
+            verificationStep = "";
+            if (verificationPanel) verificationPanel.open = false;
+            if (qrPlaceholder) qrPlaceholder.textContent = "抖音验证已完成";
+            if (qrStatus) qrStatus.textContent = "抖音验证已完成，请保存登录态。";
+          }
           browserLoginLabel = data.username || "当前账号";
           const progress = root.querySelector("[data-login-progress]");
           if (progress) progress.textContent = "第 3 步：浏览器已登录，保存后还会核对账号身份。";
@@ -1206,7 +1253,7 @@
             else item.removeAttribute("aria-current");
           });
           setStatus(`当前浏览器已登录：${browserLoginLabel}，请保存登录态。`, "success");
-        } else if (data.login_state === "unknown") {
+        } else if (data.login_state === "unknown" && !verificationStep) {
           // The page was mid-operation, so "not logged in" would be a guess.
           setStatus("正在检查登录状态…（页面正忙，请稍候再保存）", "warning");
         }
@@ -1356,6 +1403,7 @@
       recoverLease();
       return;
     }
+    if (showSmsVerification(data)) return;
     if (!response.ok || data.ok === false) {
       // A 202 with ok:false means the page did not produce a QR code yet.
       if (qrStatus) {
@@ -1858,6 +1906,7 @@
     });
   });
   root.addEventListener("login-interaction-lease-lost", () => recoverLease());
+  root.addEventListener("login-interaction-confirmed", () => scheduleStatus(800));
 
   if (section) section.addEventListener("toggle", () => { if (section.open) pollStatus(); });
   const countdown = () => {

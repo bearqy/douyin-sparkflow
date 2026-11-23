@@ -333,15 +333,17 @@
     const receiptOnly = Number(summary.receiptOnly) || 0;
     const unconfirmed = Number(summary.unconfirmed) || 0;
     const failed = Number(summary.failed) || 0;
+    const waitingForReply = Number(summary.waitingForReply) || 0;
     const blocked = Number(summary.blocked) || 0;
     const attention = Number(summary.attention) || 0;
     const pending = (Number(summary.pending) || 0) + (Number(summary.unprocessed) || 0);
     const total = Number(summary.total) || 0;
     const enabledAccounts = Number(summary.enabledAccounts) || 0;
-    const needsReview = attention > 0 || pageEcho > 0 || receiptOnly > 0;
+    const needsReview = attention > 0 || pageEcho > 0 || receiptOnly > 0 || waitingForReply > 0;
     const state = needsReview ? "attention" : "good";
     const iconName = needsReview ? "triangle-alert" : "circle-check";
-    const text = `今日结论：强确认 ${confirmed} · 弱证据（仅页面回显 ${pageEcho} · 仅回执未确认 ${receiptOnly}） · 待核验 ${unconfirmed} · 失败 ${failed} · 受账号阻断 ${blocked} · 待发送 ${pending}（共 ${total} 个目标，${enabledAccounts} 个启用账号）`;
+    const waitingText = waitingForReply ? ` · 待回复或互关 ${waitingForReply}` : "";
+    const text = `今日结论：强确认 ${confirmed} · 弱证据（仅页面回显 ${pageEcho} · 仅回执未确认 ${receiptOnly}） · 待核验 ${unconfirmed} · 失败 ${failed} · 受账号阻断 ${blocked}${waitingText} · 待发送 ${pending}（共 ${total} 个目标，${enabledAccounts} 个启用账号）`;
 
     document.querySelectorAll("[data-today-summary]").forEach((node) => {
       node.dataset.summaryState = state;

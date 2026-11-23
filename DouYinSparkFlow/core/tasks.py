@@ -351,6 +351,7 @@ def _browser_prelaunch_targets(user, targets, allow_retry, *, scope_user=None):
     )
     if not scope_ok:
         return []
+    targets = _targets_without_reply_hold(user, targets)
     from core import recovery_queue, automatic_recovery
     if recovery_queue.enabled():
         source = user if scope_user is None else scope_user
@@ -992,6 +993,8 @@ async def start_im_send_observer(page, account_name, target_name):
                         receipt["protoRefusalUnderstood"] = proto["refusalUnderstood"]
                         if proto["checkCodes"]:
                             receipt["protoCheckCodes"] = dict(proto["checkCodes"])
+                        if proto["checkTip"]:
+                            receipt["platformTip"] = proto["checkTip"]
                         receipt["ok"] = bool(http_ok and proto["ok"])
                 # A refusal code is the server's answer even when the envelope
                 # is not JSON, so it has to reach the sender as a refusal
@@ -1003,7 +1006,7 @@ async def start_im_send_observer(page, account_name, target_name):
                     if receipt.get("protoParsed"):
                         receipt["protoOk"] = False
             if not receipt["ok"]:
-                reason_text = _extract_error_text(data, body_text)
+                reason_text = receipt.get("platformTip") or _extract_error_text(data, body_text)
                 rejection = _receipt_rejection(receipt)
                 if rejection:
                     code_text = f'{rejection["key"]}={rejection["value"]}'
@@ -1379,6 +1382,7 @@ from core.task_rejections import (
     _rejection_from_json,
     _rejection_from_raw_text,
     _should_persist_recovered_browser_evidence,
+    is_private_message_limit_receipt,
 )  # noqa: F401
 
 
@@ -3120,12 +3124,17 @@ def _target_has_pre_enter_unknown_barrier_today(user, target_name, now):
     )
 
 
+def _targets_without_reply_hold(user, targets):
+    return [target for target in targets if not streak_state.waiting_for_reply_since(user, target)]
+
+
 def _pending_failed_targets(user, now):
     targets = []
+    available_targets = _targets_without_reply_hold(user, user.get("targets") or [])
     account_failure = _account_failure_entry_today(user, now)
     account_failure_targets = list(account_failure.get("affectedTargets") or [])
     if account_failure_targets:
-        for target_name in user.get("targets") or []:
+        for target_name in available_targets:
             if not any(
                 streak_state.target_keys_match(
                     user,
@@ -3147,7 +3156,7 @@ def _pending_failed_targets(user, now):
         if targets:
             return targets
 
-    for target_name in user.get("targets") or []:
+    for target_name in available_targets:
         if _target_sent_today(user, target_name, now):
             continue
         if _target_has_pre_enter_unknown_barrier_today(user, target_name, now):
@@ -3176,6 +3185,9 @@ def _pending_unsent_targets(user, now):
     skipped_targets = []
     max_attempts = _unsent_retry_max_attempts()
     for target_name in user.get("targets") or []:
+        if streak_state.waiting_for_reply_since(user, target_name):
+            skipped_targets.append(f"{target_name}(waiting_for_reply)")
+            continue
         if _target_sent_today(user, target_name, now):
             continue
         if _target_has_pre_enter_unknown_barrier_today(user, target_name, now):
@@ -3246,7 +3258,7 @@ def _select_due_targets(user, send_window, now):
         return automatic_recovery.project_due(user, send_window, now)
     # Scheduler decisions must use the same group namespace/alias rules as the
     # browser sender, otherwise 群聊：/群聊: aliases can each be scheduled.
-    targets = _dedupe_group_target_aliases(list(user.get("targets") or []))
+    targets = _dedupe_group_target_aliases(_targets_without_reply_hold(user, user.get("targets") or []))
     if not send_window.get("enabled") or (
         _is_manual_run() and not _is_fallback_run()
     ):
@@ -3390,6 +3402,15 @@ def _select_due_targets(user, send_window, now):
 def _prepare_active_users_for_run(active_config, active_user_data):
     schedule_tz = _schedule_timezone(active_config)
     now = datetime.now(schedule_tz)
+    available_users = []
+    for user in active_user_data:
+        configured_targets = user.get("targets") or []
+        available_targets = _targets_without_reply_hold(user, configured_targets)
+        if available_targets == configured_targets:
+            available_users.append(user)
+        elif available_targets:
+            available_users.append(dict(user, targets=available_targets))
+    active_user_data = available_users
 
     if not _is_manual_run() or _is_fallback_run() or os.getenv("SPARKFLOW_8610_RETRY_ONLY") == "1":
         healthy_users = []
@@ -3801,12 +3822,14 @@ def _log_rejected_state_transition(action, user, target_name, state, now, *, req
 
 def _persist_browser_send_failure(user, target_name, message, category, reason, attempted_at, server_receipt=None, override_sent_unverified=False):
     state_now = parse_sent_at(attempted_at, timezone.utc) or datetime.now(timezone.utc)
+    waiting = category == "send_rejected" and is_private_message_limit_receipt(server_receipt)
     rejected = {}
 
     def mutate(accounts):
         matched = _find_matching_account(accounts, user)
         if matched is None:
             return None, False
+        hold_saved = waiting and streak_state.mark_waiting_for_reply(matched, target_name, state_now)
         state = streak_state.mark_failed(
             matched,
             target_name,
@@ -3824,7 +3847,7 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
             != state_now.isoformat(timespec="seconds")
         ):
             rejected["state"] = dict(state)
-            return None, False
+            return None, hold_saved
         queue = dict(matched.get("failure_queue") or {})
         existing_entry = streak_state.failure_entry(
             matched,
@@ -3852,6 +3875,8 @@ def _persist_browser_send_failure(user, target_name, message, category, reason, 
         return (saved_failure, dict(matched)), True
 
     saved = update_user_data(mutate, force_reload=True)
+    if waiting:
+        streak_state.mark_waiting_for_reply(user, target_name, state_now)
     if saved is None:
         if "state" in rejected:
             _log_rejected_state_transition(

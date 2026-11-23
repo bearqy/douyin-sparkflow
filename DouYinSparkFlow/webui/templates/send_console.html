@@ -81,7 +81,8 @@
     </button>
   </div>
 
-  {% set summary_warning = summary.today_attention_targets or summary.today_page_echo_targets or summary.today_receipt_only_targets %}
+  {% set reply_wait_total = summary.waiting_for_reply_targets|default(0) %}
+  {% set summary_warning = summary.today_attention_targets or summary.today_page_echo_targets or summary.today_receipt_only_targets or reply_wait_total %}
   <div
     class="callout {% if not summary_warning %}good{% endif %}"
     data-today-summary
@@ -91,7 +92,7 @@
     <p data-today-summary-text>
       今日结论：强确认 {{ summary.today_confirmed_targets }} · 弱证据（仅页面回显 {{ summary.today_page_echo_targets }} · 仅回执未确认 {{ summary.today_receipt_only_targets }}） ·
       待核验 {{ summary.today_unconfirmed_targets }} · 失败 {{ summary.today_failed_targets }} ·
-      受账号阻断 {{ summary.today_account_blocked_targets }} · 待发送 {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
+      受账号阻断 {{ summary.today_account_blocked_targets }} · {% if reply_wait_total %}待回复或互关 {{ reply_wait_total }} · {% endif %}待发送 {{ summary.today_pending_targets + summary.today_unprocessed_targets }}
       （共 {{ summary.total_targets }} 个目标，{{ summary.enabled_accounts }} 个启用账号）
     </p>
   </div>
@@ -151,11 +152,12 @@
     <div>
       {% for account in send_console.accounts %}
       {% set exception_count = account.unconfirmed_targets|length + account.failed_targets|length + account.account_blocked_targets|length %}
+      {% set reply_wait_count = account.waiting_for_reply_targets|default([])|length %}
       {% set success_count = account.confirmed_targets|length %}
       {% set page_echo_count = account.page_echo_count %}
       {% set receipt_only_count = account.receipt_only_targets|length %}
       {% set waiting_targets = account.pending_targets + account.unprocessed_targets %}
-      {% set default_segment = "exceptions" if exception_count else ("success" if success_count else ("page_echo" if page_echo_count else ("receipt_only" if receipt_only_count else "pending"))) %}
+      {% set default_segment = "exceptions" if exception_count or reply_wait_count else ("success" if success_count else ("page_echo" if page_echo_count else ("receipt_only" if receipt_only_count else "pending"))) %}
       <details
         class="fold state-{{ account.state }}"
         id="account-{{ account.unique_id }}"
@@ -174,6 +176,7 @@
           <span class="summary-metrics">
             <span class="status-chip success">已确认 <b data-account-confirmed>{{ success_count }}</b></span>
             {% if exception_count %}<span class="status-chip danger">需处理 <b data-account-attention>{{ exception_count }}</b></span>{% endif %}
+            {% if reply_wait_count %}<span class="status-chip warning">待回复或互关 {{ reply_wait_count }}</span>{% endif %}
             {% if waiting_targets|length %}<span class="status-chip warning">待发送 <b data-account-pending>{{ waiting_targets|length }}</b></span>{% endif %}
             {% if account.account_paused %}<span class="status-chip danger">账号暂停</span>{% endif %}
             {% if account.login_verification_state == "verifying" %}<span class="status-chip">登录态验证中</span>
@@ -212,7 +215,7 @@
 
           <div class="segmented-control" data-segment-group role="tablist" aria-label="{{ account.username }} 发送状态">
             <button class="segment-button {% if default_segment == 'exceptions' %}active{% endif %}" type="button" data-segment-target="exceptions">
-              <i data-lucide="triangle-alert"></i><span>异常 {{ exception_count }}</span>
+              <i data-lucide="triangle-alert"></i><span>异常 {{ exception_count }}{% if reply_wait_count %} · 等待 {{ reply_wait_count }}{% endif %}</span>
             </button>
             <button class="segment-button {% if default_segment == 'success' %}active{% endif %}" type="button" data-segment-target="success">
               <i data-lucide="circle-check"></i><span>成功 {{ success_count }}</span>
@@ -230,6 +233,29 @@
 
           <div data-segment-panel="exceptions" {% if default_segment != "exceptions" %}hidden{% endif %}>
             <div class="target-list">
+              {% for item in account.waiting_for_reply_targets %}
+              <article class="target-record" data-send-state="waiting-for-reply">
+                <div class="target-record-main">
+                  <strong>{{ item.target }}</strong>
+                  <small>{{ item.categoryLabel }}（{{ item.rejectionCode }}）</small>
+                </div>
+                <div class="target-reason" title="{{ item.reason }}">{{ item.reason }}</div>
+                <span class="target-meta">{{ item.displayLastAttemptAt or "-" }}</span>
+                <form method="post" action="/accounts/{{ account.unique_id }}/release-reply-wait"
+                      data-confirm-title="解除等待"
+                      data-confirm="请确认对方已经回复或双方已互关。解除后，该好友会在后续正常发送计划中处理。"
+                      data-confirm-accept="确认解除" data-confirm-tone="primary">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="account_ref" value="{{ account.account_ref }}">
+                  <input type="hidden" name="login_generation" value="{{ account.login_generation|default('') }}">
+                  <input type="hidden" name="target" value="{{ item.target }}">
+                  <input type="hidden" name="target_ref" value="{{ item.targetRef }}">
+                  <input type="hidden" name="waiting_token" value="{{ item.waitingToken }}">
+                  <button class="button button-quiet button-sm" type="submit">解除等待</button>
+                </form>
+              </article>
+              {% endfor %}
+
               {% for item in account.unconfirmed_targets %}
               <article class="target-record">
                 <div class="target-record-main">
@@ -288,7 +314,7 @@
               </article>
               {% endfor %}
 
-              {% if exception_count == 0 %}
+              {% if exception_count == 0 and reply_wait_count == 0 %}
               <div class="empty-state">该账号今天没有待核验、失败或受阻断的目标。</div>
               {% endif %}
             </div>

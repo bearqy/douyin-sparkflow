@@ -20,6 +20,9 @@ from filelock import FileLock, Timeout as FileLockTimeout
 from core import identity as account_identity
 from core import streak_state
 from core.send_state import history_entry_is_strong_confirmed_today, parse_sent_at
+from core.task_rejections import (
+    PRIVATE_MESSAGE_LIMIT_CODE, PRIVATE_MESSAGE_LIMIT_TIP, WAITING_FOR_REPLY_LABEL,
+)
 from core.tasks import (
     TEMPORARY_ACCOUNT_FAILURE_CATEGORIES,
     _temporary_account_failure_cooldown_minutes,
@@ -76,6 +79,7 @@ FAILURE_CATEGORY_LABELS = {
     "friend_identity_unavailable": "聊天对象身份无法确认，已停止发送",
     "browser_cleanup_blocked": "浏览器清理未完成，需检查后恢复",
     "send_unconfirmed": "待核验",
+    "waiting_for_reply": WAITING_FOR_REPLY_LABEL,
     "login_required": "登录失效",
     "login_verification_pending": "登录态待核验",
     "protocol_login_required": "协议登录失效",
@@ -1606,6 +1610,18 @@ def _finalize_target_status(item, now):
 
 def _build_target_status(account, target_name, now, send_window):
     item = _base_target_status(account, target_name, now)
+    waiting_since, waiting_token = streak_state.waiting_for_reply(account, target_name)
+    if waiting_since:
+        item.update({
+            "status": "waiting_for_reply",
+            "category": "waiting_for_reply",
+            "reason": PRIVATE_MESSAGE_LIMIT_TIP,
+            "lastAttemptAt": waiting_since,
+            "waitingToken": waiting_token,
+            "rejectionCode": PRIVATE_MESSAGE_LIMIT_CODE,
+            "rejectionCodeField": "status_code",
+        })
+        return _finalize_target_status(item, now)
     state = streak_state.target_state(account, target_name, now)
 
     history_entry = streak_state.history_entry(account, target_name, now.tzinfo)
@@ -1900,6 +1916,7 @@ def get_send_console_snapshot(account_refs=None):
         "today_pending_targets": 0,
         "today_unprocessed_targets": 0,
         "today_account_blocked_targets": 0,
+        "waiting_for_reply_targets": 0,
         "today_attention_targets": 0,
         "today_remaining_targets": 0,
         "today_account_failures": 0,
@@ -1926,6 +1943,7 @@ def get_send_console_snapshot(account_refs=None):
         sent_targets = confirmed_targets + page_echo_targets
         unconfirmed_targets = [item for item in statuses if item["status"] == "unconfirmed"]
         failed_targets = [item for item in statuses if item["status"] == "failed"]
+        waiting_for_reply_targets = [item for item in statuses if item["status"] == "waiting_for_reply"]
         account_health = dict(account.get("account_health") or {})
         preflight_failed = account_health.get("healthy") is False
         account_failure = _account_failure_entry_today(account, now)
@@ -2007,7 +2025,7 @@ def get_send_console_snapshot(account_refs=None):
             account_state = "paused"
         elif attention_count:
             account_state = "attention"
-        elif warnings:
+        elif warnings or waiting_for_reply_targets:
             account_state = "warning"
         elif pending_count:
             account_state = "pending"
@@ -2025,6 +2043,7 @@ def get_send_console_snapshot(account_refs=None):
         summary["today_pending_targets"] += len(pending_targets)
         summary["today_unprocessed_targets"] += len(unprocessed_targets)
         summary["today_account_blocked_targets"] += len(account_blocked_targets)
+        summary["waiting_for_reply_targets"] += len(waiting_for_reply_targets)
         summary["today_attention_targets"] += attention_count
         summary["today_remaining_targets"] += (
             len(unconfirmed_targets)
@@ -2032,6 +2051,7 @@ def get_send_console_snapshot(account_refs=None):
             + len(pending_targets)
             + len(unprocessed_targets)
             + len(account_blocked_targets)
+            + len(waiting_for_reply_targets)
         )
         summary["today_warning_count"] += len(warnings)
         summary["orphan_history_records"] += len(orphan_history)
@@ -2063,6 +2083,7 @@ def get_send_console_snapshot(account_refs=None):
                 "pending_targets": pending_targets,
                 "unprocessed_targets": unprocessed_targets,
                 "account_blocked_targets": account_blocked_targets,
+                "waiting_for_reply_targets": waiting_for_reply_targets,
                 "last_failure_reason": failed_targets[0]["reason"] if failed_targets else "",
                 "last_unconfirmed_reason": unconfirmed_targets[0]["reason"] if unconfirmed_targets else "",
                 "failure_queue": dict(account.get("failure_queue") or {}),
@@ -2146,6 +2167,7 @@ def get_overview_snapshot(account_refs=None):
             "receiptOnly": summary.get("today_receipt_only_targets", 0),
             "unconfirmed": summary["today_unconfirmed_targets"],
             "failed": summary["today_failed_targets"],
+            "waitingForReply": summary.get("waiting_for_reply_targets", 0),
             "blocked": summary["today_account_blocked_targets"],
             "attention": summary["today_attention_targets"],
             "pending": summary["today_pending_targets"],

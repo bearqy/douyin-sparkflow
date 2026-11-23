@@ -183,8 +183,8 @@ def _no_duplicate_keys(pairs):
     return out
 
 
-def _check_message_codes(text):
-    """(understood, non-zero codes) for the check_message text.
+def _check_message_summary(text):
+    """Return whether check_message is understood, its non-zero codes and its tip.
 
     Empty means nothing to say. A JSON object is walked at every depth (objects
     and arrays). It is understood only when every known code key, wherever it
@@ -194,9 +194,9 @@ def _check_message_codes(text):
     unparseable text are still reported for the refusal record.
     """
     if not text:
-        return True, {}
+        return True, {}, ""
     if len(text.encode("utf-8", errors="replace")) > MAX_CHECK_MESSAGE_BYTES:
-        return False, _raw_text_codes(text[:MAX_CHECK_MESSAGE_BYTES])
+        return False, _raw_text_codes(text[:MAX_CHECK_MESSAGE_BYTES]), ""
     try:
         # Repeated keys (after JSON unescaping) would let a later value hide an
         # earlier refusal code, so the whole message is "not understood".
@@ -204,7 +204,7 @@ def _check_message_codes(text):
     except (ValueError, RecursionError):
         data = None
     if not isinstance(data, dict):
-        return False, _raw_text_codes(text)
+        return False, _raw_text_codes(text), ""
     codes = {}
     understood = True
     stack = [(data, 0)]
@@ -227,14 +227,17 @@ def _check_message_codes(text):
             stack.extend((item, depth + 1) for item in node if isinstance(item, (dict, list)))
     if not understood and not codes:
         codes = _raw_text_codes(text)
-    return understood, codes
+    status_message = data.get("status_msg")
+    content = status_message.get("msg_content") if isinstance(status_message, dict) else None
+    tip = content.get("tips") if isinstance(content, dict) else None
+    return understood, codes, " ".join(tip.split())[:180] if isinstance(tip, str) else ""
 
 
 def parse_send_response(raw):
     """Summary of a binary send receipt, or ``None`` when it is not one.
 
     Returns ``{"ok", "cmd", "statusCode", "errorDesc", "sendStatus",
-    "checkCode", "hasServerMessageId", "checkCodes", "logId"}``. ``ok`` is
+    "checkCode", "hasServerMessageId", "checkCodes", "checkTip", "logId"}``. ``ok`` is
     True only for an unambiguous acceptance.
     """
     if not isinstance(raw, (bytes, bytearray)) or not raw:
@@ -260,13 +263,13 @@ def parse_send_response(raw):
         unknown_send_fields = bool(send is not None and set(send) - _SEND_KNOWN_FIELDS)
         send_status = check_code = None
         has_message_id = False
-        check_understood, check_codes = True, {}
+        check_understood, check_codes, check_tip = True, {}, ""
         if send is not None:
             server_message_id = _varint_field(send, 1)
             has_message_id = bool(server_message_id)
             send_status = _varint_field(send, 3)
             check_code = _varint_field(send, 5)
-            check_understood, check_codes = _check_message_codes(_text(_bytes_field(send, 6)))
+            check_understood, check_codes, check_tip = _check_message_summary(_text(_bytes_field(send, 6)))
     except _Malformed:
         return None
     if cmd is None and status_code is None and send is None:
@@ -284,6 +287,13 @@ def parse_send_response(raw):
         and not unknown_body_fields
         and has_message_id
     )
+    # Diagnostic provenance only. A raw match in malformed JSON or a foreign
+    # schema cannot establish a platform tip or eligibility for a retry.
+    refusal_understood = bool(
+        cmd == SEND_CMD and status_code == 0 and error_desc == "OK"
+        and send is not None and check_understood and check_codes
+        and not unknown_send_fields and not unknown_body_fields
+    )
     return {
         "ok": ok,
         "cmd": cmd,
@@ -293,13 +303,7 @@ def parse_send_response(raw):
         "checkCode": check_code,
         "hasServerMessageId": has_message_id,
         "checkCodes": check_codes,
-        # Diagnostic refusal provenance only; does not alter acceptance. A raw
-        # numeric match inside malformed JSON/unknown schema is not a known
-        # embedded rejection suitable for an automatic retry policy.
-        "refusalUnderstood": bool(
-            cmd == SEND_CMD and status_code == 0 and error_desc == "OK"
-            and send is not None and check_understood and check_codes
-            and not unknown_send_fields and not unknown_body_fields
-        ),
+        "checkTip": check_tip if refusal_understood else "",
+        "refusalUnderstood": refusal_understood,
         "logId": log_id[:120],
     }

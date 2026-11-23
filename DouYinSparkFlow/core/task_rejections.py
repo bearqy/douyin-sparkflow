@@ -144,6 +144,23 @@ def _receipt_rejection(receipt):
     return dict(rejection) if isinstance(rejection, dict) else None
 
 
+PRIVATE_MESSAGE_LIMIT_CODE = 7467
+PRIVATE_MESSAGE_LIMIT_TIP = "给对方发送的消息已达上限，对方回复或互关后才能继续发送消息"
+WAITING_FOR_REPLY_LABEL = "待对方回复或互关"
+
+
+def is_private_message_limit_receipt(receipt):
+    rejection = _receipt_rejection(receipt)
+    return bool(
+        rejection
+        and receipt.get("call") == "message_send"
+        and receipt.get("ok") is False
+        and rejection.get("key") == "status_code"
+        and type(rejection.get("value")) is int
+        and rejection["value"] == PRIVATE_MESSAGE_LIMIT_CODE
+    )
+
+
 def _should_persist_recovered_browser_evidence(sent_ok, error):
     """Whether the page bubble may stand in for the server's answer.
 

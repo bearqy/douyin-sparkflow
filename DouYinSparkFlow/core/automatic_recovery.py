@@ -41,7 +41,8 @@ def _same_day(value, now):
 
 def _blocked_target(account, target, now):
     t = _tasks()
-    return (t._target_sent_today(account, target, now)
+    return (streak_state.waiting_for_reply_since(account, target)
+            or t._target_sent_today(account, target, now)
             or t._target_unconfirmed_today(account, target, now)
             or streak_state.is_sent_unverified(account, target, now)
             or streak_state.attempt_in_progress(account, target, now))
@@ -114,6 +115,8 @@ def dispatch_allowed(user, now=None):
     target = ticket.get('target')
     if user.get('targets') != [target] or not any(
             streak_state.target_keys_match(fresh, target, x) for x in fresh.get('targets') or []):
+        return False
+    if streak_state.waiting_for_reply_since(fresh, target):
         return False
     if (not fresh.get('enabled', True)
             or not streak_state.preflight_account(fresh, now).get('healthy')

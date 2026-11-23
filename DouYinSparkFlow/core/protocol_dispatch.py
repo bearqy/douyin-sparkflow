@@ -10,7 +10,9 @@ from pathlib import Path
 
 from core import refusal_retry, send_pause
 from core import streak_state
+from core.im_receipt import _check_message_summary
 from core.msg_builder import build_messages_for_targets
+from core.task_rejections import PRIVATE_MESSAGE_LIMIT_CODE
 from utils.config import get_userData, normalize_unique_id, repo_root, update_user_data
 from utils.logger import setup_logger
 
@@ -178,6 +180,17 @@ def _protocol_failure_reason(entry):
     return " ".join(bits)
 
 
+def _protocol_waiting_for_reply(entry):
+    summary = entry.get("sendResultSummary") or {}
+    check = summary.get("checkMsg") or summary.get("checkMessage")
+    if isinstance(check, dict):
+        return type(check.get("status_code")) is int and check["status_code"] == PRIVATE_MESSAGE_LIMIT_CODE
+    if isinstance(check, str):
+        understood, codes, _ = _check_message_summary(check)
+        return understood and codes.get("status_code") == PRIVATE_MESSAGE_LIMIT_CODE
+    return False
+
+
 def _protocol_entry_succeeded(entry):
     if entry.get("dryRun"):
         return False
@@ -224,15 +237,17 @@ def _record_protocol_target_failure(
     reason,
     *,
     now=None,
+    waiting_for_reply=False,
 ):
     now = now or datetime.now(timezone.utc)
     now_iso = now.isoformat(timespec="seconds")
+    hold_saved = waiting_for_reply and streak_state.mark_waiting_for_reply(target_account, target_name, now)
     state = streak_state.mark_failed(
         target_account,
         target_name,
         category=category,
         reason=reason,
-        retryable=category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
+        retryable=not waiting_for_reply and category not in streak_state.TERMINAL_FAILURE_CATEGORIES,
         now=now,
         strategy="protocol",
     )
@@ -241,7 +256,7 @@ def _record_protocol_target_failure(
         or str(state.get("lastErrorCategory") or "") != str(category or "")
         or str(state.get("lastAttemptAt") or "") != now_iso
     ):
-        return False
+        return hold_saved
     queue = dict(target_account.get("failure_queue") or {})
     existing_entry = streak_state.failure_entry(
         target_account,
@@ -378,6 +393,7 @@ def _apply_protocol_runtime_state(all_accounts, accounts, result_by_username):
                 _protocol_failure_category(entry),
                 _protocol_failure_reason(entry),
                 now=failure_at,
+                waiting_for_reply=_protocol_waiting_for_reply(entry),
             ) or changed
 
         unresolved = result.get("unresolved", []) or []

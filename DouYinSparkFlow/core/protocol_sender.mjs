@@ -145,7 +145,7 @@ function publicSendResultSummary(sendResult) {
     return {};
   }
   const summary = {};
-  for (const key of ["success", "statusCode", "statusMsg", "checkCode", "checkMsg", "errorCode", "errorMsg"]) {
+  for (const key of ["success", "statusCode", "statusMsg", "checkCode", "checkMsg", "checkMessage", "errorCode", "errorMsg"]) {
     if (sendResult[key] !== undefined) {
       summary[key] = sendResult[key];
     }
